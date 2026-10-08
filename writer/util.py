@@ -1,7 +1,12 @@
 import asyncio
 
-from influxdb_client import InfluxDBClient
+from influxdb_client import (
+    InfluxDBClient,
+    WriteOptions,
+)
+
 from confluent_kafka import Consumer, KafkaException
+from confluent_kafka.aio import AIOConsumer
 
 
 def initialize_kafka(config):
@@ -49,6 +54,7 @@ def initialize_influx_client(config):
                 10,
             ),
         )
+        
 
         return client
 
@@ -58,10 +64,36 @@ def initialize_influx_client(config):
         ) from error
 
 
-def initialize_write_api(client):
+def initialize_write_api(client, config):
 
     try:
-        return client.write_api()
+        
+        write_options = WriteOptions(
+            batch_size=config.get(
+                "batch_size",
+                1000,
+            ),
+
+            flush_interval=config.get(
+                "flush_interval",
+                1000,
+            ),
+
+            retry_interval=config.get(
+                "retry_interval",
+                5000,
+            ),
+
+            max_retries=config.get(
+                "max_retries",
+                5,
+            ),
+        )
+
+        return client.write_api(
+            write_options=write_options
+        )
+
 
     except Exception as error:
         raise RuntimeError(
@@ -72,7 +104,8 @@ def initialize_write_api(client):
 async def write_to_influx(write_api, message, config):
 
     try:
-        await write_api.write(
+        await asyncio.to_thread(
+            write_api.write,
             bucket=config["bucket"],
             org=config["org"],
             record=message,
@@ -89,8 +122,7 @@ async def commit_kafka_message(consumer, message_data):
 
     try:
 
-        await asyncio.to_thread(
-            consumer.commit,
+        await consumer.commit(
 
             message=message_data["record"],
 
@@ -111,9 +143,7 @@ async def close_kafka_consumer(consumer):
 
     try:
 
-        await asyncio.to_thread(
-            consumer.close
-        )
+        await consumer.close()
 
     except Exception as error:
 
@@ -130,6 +160,7 @@ async def close_influx_resources(client, write_api):
 
             await asyncio.to_thread(
                 write_api.close
+
             )
 
         except Exception as error:

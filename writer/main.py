@@ -30,14 +30,14 @@ class MemoryBuffer:
 
 
 
-async def kafka_consumer(memory_buffer, commit_queue, config):
+async def kafka_consumer(memory_buffer, config):
 
     consumer = None
 
     try:
-        consumer = initialize_kafka(config)
+        consumer = awaitinitialize_kafka(config)
 
-        consumer.subscribe([
+        await consumer.subscribe([
             config["kafka_topic"]
         ])
 
@@ -45,9 +45,8 @@ async def kafka_consumer(memory_buffer, commit_queue, config):
 
             try:
 
-                record = await asyncio.to_thread(
-                    consumer.poll,
-                    config.get(
+                record = await consumer.poll(
+                    timeout=config.get(
                         "poll_timeout",
                           1.0,
                     ),
@@ -76,30 +75,10 @@ async def kafka_consumer(memory_buffer, commit_queue, config):
                     message_data
                 )
 
-                while not commit_queue.empty():
-
-                    commit_data = await commit_queue.get()
-
-                    try:
-
-                        await commit_kafka_message(
-                            consumer,
-                            commit_data,
-                        )
-
-                    except Exception as error:
-
-                        print(
-                            f"Kafka commit error: {error}"
-                        )
-
-                        await commit_queue.put(
-                            commit_data
-                        )
-
-                    finally:
-
-                        commit_queue.task_done()
+                await commit_kafka_message(
+                    consumer,
+                    message_data,
+                )
 
             except Exception as error:
 
@@ -114,7 +93,7 @@ async def kafka_consumer(memory_buffer, commit_queue, config):
         )
 
 
-async def influx_writer(memory_buffer, commit_queue, config):
+async def influx_writer(memory_buffer, config):
 
     client = None
     write_api = None
@@ -123,7 +102,7 @@ async def influx_writer(memory_buffer, commit_queue, config):
 
         client = initialize_influx_client(config)
 
-        write_api = initialize_write_api(client)
+        write_api = initialize_write_api(client, config)
 
         while True:
 
@@ -139,13 +118,7 @@ async def influx_writer(memory_buffer, commit_queue, config):
                     config,
                 )
 
-                if success:
-
-                    await commit_queue.put(
-                        message_data
-                    )
-
-                else:
+                if not success:
 
                     await memory_buffer.requeue(message_data)
 
@@ -185,12 +158,11 @@ async def influx_writer(memory_buffer, commit_queue, config):
         )
 
 
-async def supervisor(memory_buffer, commit_queue, config):
+async def supervisor(memory_buffer, config):
 
     kafka_task = asyncio.create_task(
         kafka_consumer(
             memory_buffer,
-            commit_queue,
             config,
         )
     )
@@ -198,7 +170,6 @@ async def supervisor(memory_buffer, commit_queue, config):
     writer_task = asyncio.create_task(
         influx_writer(
             memory_buffer,
-            commit_queue,
             config,
         )
     )
@@ -237,7 +208,6 @@ async def supervisor(memory_buffer, commit_queue, config):
             kafka_task = asyncio.create_task(
                 kafka_consumer(
                     memory_buffer,
-                    commit_queue,
                     config,
                 )
             )
@@ -266,7 +236,6 @@ async def supervisor(memory_buffer, commit_queue, config):
             writer_task = asyncio.create_task(
                 influx_writer(
                     memory_buffer,
-                    commit_queue,
                     config,
                 )
             )
@@ -281,10 +250,7 @@ async def main(config):
         )
     )
 
-    commit_queue = asyncio.Queue()
-
     await supervisor(
         memory_buffer,
-        commit_queue,
         config,
     )
