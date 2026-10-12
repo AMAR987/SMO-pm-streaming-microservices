@@ -1,0 +1,65 @@
+version: "3.9"
+services:
+
+  # ZooKeeper
+  message-router-zookeeper:
+    image: bitnamilegacy/zookeeper:3.9
+    container_name: message-router-zookeeper
+    environment:
+      - ALLOW_ANONYMOUS_LOGIN=yes
+    ports:
+      - "2181:2181"
+    networks:
+      - hv-ves-net
+
+  # Kafka
+  message-router-kafka-0:
+    image: bitnamilegacy/kafka:3.7.0
+    container_name: message-router-kafka-0
+    depends_on:
+      - message-router-zookeeper
+    environment:
+      - KAFKA_ENABLE_KRAFT=no
+      - KAFKA_CFG_BROKER_ID=1
+      - KAFKA_CFG_ZOOKEEPER_CONNECT=message-router-zookeeper:2181
+      - KAFKA_CFG_LISTENERS=SASL_PLAINTEXT://:9092
+      - KAFKA_CFG_ADVERTISED_LISTENERS=SASL_PLAINTEXT://message-router-kafka-0:9092
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=SASL_PLAINTEXT:SASL_PLAINTEXT
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=SASL_PLAINTEXT
+      - KAFKA_CFG_SASL_ENABLED_MECHANISMS=PLAIN
+      - KAFKA_CFG_SASL_MECHANISM_INTER_BROKER_PROTOCOL=PLAIN
+      - KAFKA_CLIENT_USERS=admin
+      - KAFKA_CLIENT_PASSWORDS=admin_secret
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+      - KAFKA_CFG_DELETE_TOPIC_ENABLE=true
+      - KAFKA_CFG_NUM_PARTITIONS=1
+      - KAFKA_CFG_DEFAULT_REPLICATION_FACTOR=1
+      - KAFKA_CFG_OFFSETS_TOPIC_REPLICATION_FACTOR=1
+
+      - ALLOW_PLAINTEXT_LISTENER=no
+    ports:
+      - "29093:9092"
+    networks:
+      - hv-ves-net
+
+  # # HV-VES Collector
+  # hv-ves:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   image: hv-ves-collector:latest
+  #   container_name: hv-ves
+  #   depends_on:
+  #     - message-router-zookeeper
+  #     - message-router-kafka-0
+  #   ports:
+  #     - "8008:8000"
+  #   volumes:
+  #     - ./meta.json:/meta.json
+  #     - ./logs:/logs
+  #   networks:
+  #     - hv-ves-net
+
+networks:
+  hv-ves-net:
+    driver: bridge
