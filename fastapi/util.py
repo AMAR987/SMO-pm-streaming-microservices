@@ -22,7 +22,7 @@ class StreamInfoRequest(BaseModel):
     stream_type: str = Field(..., alias="StreamType", min_length=1)
     serialization_format: str = Field("GPB", alias="SerializationFormat")
     meas_obj_dn: str = Field("", alias="measObjDn")
-    performance_metrics: List[Any] = Field( ...,alias="performanceMetrics",min_length=1,)
+    performance_metrics: List[Any] = Field(default_factory=list, alias="performanceMetrics")
     vs_data_container: Dict[str, Any] = Field(default_factory=dict, alias="VsDataContainer")
 
     @model_validator(mode="before")
@@ -70,9 +70,7 @@ class ConnectionRequest(BaseModel):
 
 class StreamRequest(StreamInfoRequest):
     """Request body used to add one stream to an existing connection."""
-CONNECTION_TTL = max(0, int(os.getenv("CONNECTION_TTL", "0")))
-# Keep empty for compatibility with existing keys; configure a prefix for isolated deployments.
-REDIS_KEY_PREFIX = os.getenv("REDIS_KEY_PREFIX", "")
+CONNECTION_TTL = int(os.getenv("CONNECTION_TTL", "300"))
 REDIS_HOST = os.getenv("REDIS_HOST", "redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
@@ -99,6 +97,7 @@ REDIS_RETRY_ERRORS = [
     RedisTimeoutError,
     ConnectionResetError,
 ]
+
 @dataclass
 class StreamInfo:
     stream_id: str
@@ -109,16 +108,16 @@ class StreamInfo:
     vs_data_container: Dict[str, Any] = field(default_factory=dict)
     last_activity: float = field(default_factory=time.time)
 
+
 @dataclass
 class ConnectionInfo:
     connection_id: str
     producer_id: str = ""
     default_stream_id: Optional[str] = None
     streams: Dict[str, StreamInfo] = field(default_factory=dict)
-    streams_metaData: Dict[str, Any] = field(default_factory=dict)
-    hash_map: Dict[str, str] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
+
 class ClientInfo:
 
     def __init__(self):
@@ -128,36 +127,37 @@ class ClientInfo:
         self.pending_upserts: Dict[str, ConnectionInfo] = {}
         self.pending_deletes: set[str] = set()
 
-    def _redis_key(self, connection_id: str) -> str:
-        return f"{REDIS_KEY_PREFIX}{connection_id}"
-
     async def init_redis(self) -> bool:
         async with self.redis_init_lock:
             if self.redis is not None:
-                return True
+                try:
+                    await self.redis.ping()
+                    return True
+                except Exception:
+                    logger.warning("Existing Redis connection is unavailable")
+                    await self.close_redis()
             candidate = Redis(
                 host=REDIS_HOST,
                 port=REDIS_PORT,
                 db=REDIS_DB,
                 decode_responses=True,
-                retry=Retry(
-                    ExponentialBackoff(
-                        cap=REDIS_BACKOFF_CAP,
-                        base=REDIS_BACKOFF_BASE,
-                    ),
-                    REDIS_RETRY_COUNT,
-                ),
+                retry=REDIS_RETRY,
                 retry_on_error=REDIS_RETRY_ERRORS,
                 health_check_interval=REDIS_HEALTH_CHECK_INTERVAL,
                 socket_connect_timeout=REDIS_SOCKET_CONNECT_TIMEOUT,
                 socket_timeout=REDIS_SOCKET_TIMEOUT,
             )
+
             try:
                 await candidate.ping()
                 self.redis = candidate
                 logger.info(
-                    "Redis connection established (host=%s, port=%s, db=%s)",
-                    REDIS_HOST, REDIS_PORT, REDIS_DB,
+                    "Redis connection established (retry_count=%d, backoff=%ss->%ss, "
+                    "health_check_interval=%ss)",
+                    REDIS_RETRY_COUNT,
+                    REDIS_BACKOFF_BASE,
+                    REDIS_BACKOFF_CAP,
+                    REDIS_HEALTH_CHECK_INTERVAL,
                 )
                 return True
             except Exception:
@@ -226,25 +226,15 @@ class ClientInfo:
         return connection
 
     async def _redis_set(self, connection: ConnectionInfo) -> bool:
-        """Persist connection metadata as one JSON value in Redis."""
-        try:
-            payload = json.dumps(self._connection_to_dict(connection), separators=(",", ":"))
-        except (TypeError, ValueError):
-            logger.exception(
-                "Connection metadata for %s is not JSON serializable",
-                connection.connection_id,
-            )
-            return False
-
+        """Write metadata to Redis. Returns False if Redis is unavailable."""
         if not await self.init_redis():
             return False
         try:
-            key = self._redis_key(connection.connection_id)
-            if CONNECTION_TTL > 0:
-                await self.redis.set(key, payload, ex=CONNECTION_TTL)
-            else:
-                await self.redis.set(key, payload)
-            logger.debug("Stored connection metadata in Redis: key=%s", key)
+            await self.redis.set(
+                connection.connection_id,
+                json.dumps(self._connection_to_dict(connection)),
+                ex=CONNECTION_TTL,
+            )
             return True
         except Exception:
             logger.exception(
@@ -258,7 +248,7 @@ class ClientInfo:
         if not await self.init_redis():
             return False, None
         try:
-            data = await self.redis.get(self._redis_key(connection_id))
+            data = await self.redis.get(connection_id)
             if data is None:
                 return True, None
             return True, self._dict_to_connection(json.loads(data))
@@ -271,7 +261,7 @@ class ClientInfo:
         if not await self.init_redis():
             return False
         try:
-            await self.redis.delete(self._redis_key(connection_id))
+            await self.redis.delete(connection_id)
             return True
         except Exception:
             logger.exception("Redis DELETE failed for %s", connection_id)
@@ -311,8 +301,7 @@ class ClientInfo:
                 return
         for connection_id, connection in list(self.pending_upserts.items()):
             if await self._redis_set(connection):
-                if self.pending_upserts.get(connection_id) is connection:
-                    self.pending_upserts.pop(connection_id, None)
+                self.pending_upserts.pop(connection_id, None)
                 logger.info(
                     "Pending Redis update synchronized for %s",
                     connection_id,
@@ -407,6 +396,7 @@ class ClientInfo:
         return connection
 
     async def save_connection(self, connection: ConnectionInfo) -> bool:
+        """Persist metadata, retaining a process-local retry if Redis is down."""
         if await self._redis_set(connection):
             self.pending_upserts.pop(connection.connection_id, None)
             self.pending_deletes.discard(connection.connection_id)
@@ -487,7 +477,8 @@ class ClientInfo:
             stream = connection.streams.get(stream_id)
             if stream:
                 stream.last_activity = now
-        await self.save_connection(connection)
+        if not await self._redis_set(connection):
+            self._store_pending_upsert(connection)
         return True
 
     async def delete_stream(
