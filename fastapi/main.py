@@ -120,14 +120,6 @@ async def create_connection(request: Request):
             status_code=400,
             content={"errorReason": message},
         )
-    seen_stream_ids = set()
-    for stream_info in parsed.stream_info_list:
-        if stream_info.stream_id in seen_stream_ids:
-            return JSONResponse(
-                status_code=400,
-                content={"errorReason": "Data does not conform to schema"},
-            )
-        seen_stream_ids.add(stream_info.stream_id)
     first_stream = parsed.stream_info_list[0]
     connection = await db.create_connection(
         stream_type=utils.validate_stream_request(first_stream),
@@ -156,8 +148,12 @@ async def create_connection(request: Request):
     )
     return JSONResponse(
         status_code=201,
-        headers={"location": f"/connections/{connection.connection_id}"},
-        content={"Info": "Connection to hv-ves has been accepted."},
+        headers={
+            "location": f"/connections/{connection.connection_id}"
+        },
+        content={
+            "Info": "Connection to hv-ves has been accepted."
+        },
     )
 
 
@@ -183,39 +179,47 @@ async def create_stream(
                 "Error": "Data does not conform to schema."
             },
         )
-    redis_available, connection = await db.get_connection_lookup(connection_id)
+    redis_available, connection = await db.get_connection_lookup(
+        connection_id
+    )
 
     if connection is None:
         if not redis_available:
             logger.warning(
-                "Cannot add stream to %s: Redis is unavailable and no local "
-                "connection metadata is available",
+                "Cannot add stream to %s: Redis is unavailable "
+                "and no local connection metadata is available",
                 connection_id,
             )
             return JSONResponse(
                 status_code=503,
-                content={"Error": "Connection metadata temporarily unavailable."},
+                content={
+                    "Error": (
+                        "Connection metadata temporarily unavailable."
+                    )
+                },
             )
         return JSONResponse(
             status_code=400,
-            content={"Error": "URI entered does not exist."},
+            content={
+                "Error": "URI entered does not exist."
+            },
         )
     if parsed.stream_id in connection.streams:
         return JSONResponse(
             status_code=400,
-            content={"Error": "New stream cannot be created."},
+            content={
+                "Error": "New stream cannot be created."
+            },
         )
     stream = utils.StreamInfo(
         stream_id=parsed.stream_id,
         stream_type=utils.validate_stream_request(parsed),
         serialization_format=parsed.serialization_format,
-        stream_id=parsed.stream_id,
         meas_obj_dn=parsed.meas_obj_dn,
         performance_metrics=parsed.performance_metrics,
         vs_data_container=parsed.vs_data_container,
     )
     connection.streams[stream.stream_id] = stream
-
     if not connection.default_stream_id:
         connection.default_stream_id = stream.stream_id
     saved_to_redis = await db.save_connection(connection)
@@ -233,7 +237,9 @@ async def create_stream(
     )
     return JSONResponse(
         status_code=200,
-        content={"Info": "Stream successfully added."},
+        content={
+            "Info": "Stream successfully added."
+        },
     )
 
 
@@ -245,17 +251,23 @@ async def get_connection(connection_id: str):
     if connection is None:
         if not redis_available:
             logger.warning(
-                "GET connection %s: Redis is unavailable and no local metadata "
-                "is available",
+                "GET connection %s: Redis is unavailable "
+                "and no local metadata is available",
                 connection_id,
             )
             return JSONResponse(
                 status_code=503,
-                content={"Error": "Connection metadata temporarily unavailable."},
+                content={
+                    "Error": (
+                        "Connection metadata temporarily unavailable."
+                    )
+                },
             )
         return JSONResponse(
             status_code=400,
-            content={"Error": "Connection id does not exist."},
+            content={
+                "Error": "Connection id does not exist."
+            },
         )
     info = {
         stream_id: utils.stream_response_fields(stream)
@@ -355,8 +367,14 @@ async def websocket_endpoint(
             if connection is not None:
                 break
             if redis_available:
-                logger.warning("WebSocket connection ID not found: %s", connection_id)
-                await websocket.close(code=1008, reason="Connection id does not exist.")
+                logger.warning(
+                    "WebSocket connection ID not found: %s",
+                    connection_id,
+                )
+                await websocket.close(
+                    code=1000,
+                    reason="Connection id does not exist.",
+                )
                 return
             logger.warning(
                 "Connection metadata unavailable for %s because "
@@ -384,8 +402,14 @@ async def websocket_endpoint(
                 None,
             )
         if stream is None:
-            logger.error("No stream metadata available for connection %s", connection_id)
-            await websocket.close(code=1008, reason="Stream metadata unavailable")
+            logger.error(
+                "No stream metadata available for connection %s",
+                connection_id,
+            )
+            await websocket.close(
+                code=1008,
+                reason="Stream metadata unavailable",
+            )
             return
         stream_type = stream.stream_type
         logger.info(
