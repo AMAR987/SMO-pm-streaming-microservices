@@ -357,7 +357,6 @@ async def websocket_endpoint(
         "WebSocket accepted; resolving metadata for %s",
         connection_id,
     )
-
     lookup_delay = 1.0
     lookup_cap = 10.0
     try:
