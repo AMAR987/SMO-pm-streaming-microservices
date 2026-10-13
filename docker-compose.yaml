@@ -1,7 +1,5 @@
 version: "3.9"
 services:
-
-  # ZooKeeper
   message-router-zookeeper:
     image: bitnamilegacy/zookeeper:3.9
     container_name: message-router-zookeeper
@@ -11,8 +9,6 @@ services:
       - "2181:2181"
     networks:
       - hv-ves-net
-
-  # Kafka
   message-router-kafka-0:
     image: bitnamilegacy/kafka:3.7.0
     container_name: message-router-kafka-0
@@ -22,14 +18,19 @@ services:
       - KAFKA_ENABLE_KRAFT=no
       - KAFKA_CFG_BROKER_ID=1
       - KAFKA_CFG_ZOOKEEPER_CONNECT=message-router-zookeeper:2181
-      - KAFKA_CFG_LISTENERS=SASL_PLAINTEXT://:9092
-      - KAFKA_CFG_ADVERTISED_LISTENERS=SASL_PLAINTEXT://message-router-kafka-0:9092
-      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=SASL_PLAINTEXT:SASL_PLAINTEXT
-      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=SASL_PLAINTEXT
+
+      # Internal access for Kafka UI and other Docker containers.
+      # External access for your producer on another PC.
+      - KAFKA_CFG_LISTENERS=INTERNAL://:9092,EXTERNAL://:9093
+      - KAFKA_CFG_ADVERTISED_LISTENERS=INTERNAL://message-router-kafka-0:9092,EXTERNAL://10.1.210.206:29093
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=INTERNAL:SASL_PLAINTEXT,EXTERNAL:SASL_PLAINTEXT
+      - KAFKA_CFG_INTER_BROKER_LISTENER_NAME=INTERNAL
+
       - KAFKA_CFG_SASL_ENABLED_MECHANISMS=PLAIN
       - KAFKA_CFG_SASL_MECHANISM_INTER_BROKER_PROTOCOL=PLAIN
       - KAFKA_CLIENT_USERS=admin
       - KAFKA_CLIENT_PASSWORDS=admin_secret
+
       - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
       - KAFKA_CFG_DELETE_TOPIC_ENABLE=true
       - KAFKA_CFG_NUM_PARTITIONS=1
@@ -38,7 +39,25 @@ services:
 
       - ALLOW_PLAINTEXT_LISTENER=no
     ports:
-      - "29093:9092"
+      - "29093:9093"
+    networks:
+      - hv-ves-net
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    restart: unless-stopped
+    depends_on:
+      - message-router-kafka-0
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: hv-ves
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: message-router-kafka-0:9092
+      KAFKA_CLUSTERS_0_PROPERTIES_SECURITY_PROTOCOL: SASL_PLAINTEXT
+      KAFKA_CLUSTERS_0_PROPERTIES_SASL_MECHANISM: PLAIN
+      KAFKA_CLUSTERS_0_PROPERTIES_SASL_JAAS_CONFIG: >-
+        org.apache.kafka.common.security.plain.PlainLoginModule required
+        username="admin" password="admin_secret";
     networks:
       - hv-ves-net
 
