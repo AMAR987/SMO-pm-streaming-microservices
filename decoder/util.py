@@ -2,12 +2,14 @@ import asyncio
 import json
 import base64
 import logging
-
+from google.protobuf.json_format import MessageToDict
+from google.protobuf.json_format import MessageToDict
+from protobuf_py import Perf3gppFields_pb2
+from protobuf_py import VesEvent_pb2
 from aiokafka import (
     AIOKafkaConsumer,
     AIOKafkaProducer,
 )
-
 from aiokafka.errors import (
     KafkaConnectionError,
     KafkaTimeoutError,
@@ -16,9 +18,14 @@ from aiokafka.errors import (
     MessageSizeTooLargeError,
     KafkaError,
 )
-KAFKA_BOOTSTRAP_SERVERS = "localhost:9092"
-
-INPUT_TOPIC = "PERF3GPP_TOPIC"
+KAFKA_BOOTSTRAP_SERVERS = "10.1.210.206:32776"
+KAFKA_SECURITY_CONFIG = {
+    "security_protocol": "SASL_PLAINTEXT",
+    "sasl_mechanism": "PLAIN", 
+    "sasl_plain_username": "admin",
+    "sasl_plain_password": "admin_secret",
+}
+INPUT_TOPIC = "HV_VES_PERF3GPP"
 OUTPUT_TOPIC = "DECODED_PERF"
 
 CONSUMER_GROUP_ID = "perf3gpp-decoder-group"
@@ -55,70 +62,198 @@ KAFKA_CONNECTION_ERRORS = (
     NoBrokersAvailable,
     KafkaTimeoutError,
 )
-def decode_perf(encoded_data):
+def validate_ves_event(ves_event):
 
+    header = ves_event.commonEventHeader
+
+    if (
+        header.version != "1.0"
+        or header.domain != "perf3gpp"
+        or header.vesEventListenerVersion != "7.2"
+    ):
+        return False
+
+    return True
+
+def decode_ves_event(payload, source_name, kpi_names):
     try:
+        ves_event = VesEvent_pb2.VesEvent()
 
-        decoded_data = {
-            "status": "decoded",
-            "size": len(encoded_data),
-        }
+        ves_event.ParseFromString(payload)
 
-        return decoded_data
+        if not validate_ves_event(ves_event):
+            raise ValueError("Invalid VES event header")
 
+        header = ves_event.commonEventHeader
+
+        return decode_perf_event(
+            ves_event.eventFields,
+            header.reportingEntityName,
+            source_name,
+            kpi_names
+        )
     except Exception as error:
+        raise RuntimeError(
+            f"VES Decode FAILED: {error}"
+        ) from error
+def validate_perf3gpp(perf):
 
+    return perf.perf3gppFieldsVersion == "1.0"
+def decode_perf_event(payload,eportingEntityName="unknown",sourceName="unknown",kpi_names=None):
+    try:
+        perf = Perf3gppFields_pb2.Perf3gppFields()
+        perf.ParseFromString(payload)
+        if not validate_perf3gpp(perf):
+            raise ValueError(
+                "Invalid PERF3GPP version: "
+                f"{perf.perf3gppFieldsVersion}"
+            )
+        return decode_meas_data(
+            perf,
+            reportingEntityName,
+            sourceName,
+            kpi_names
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"PERF Decode FAILED: {error}"
+        ) from error
+def decode_meas_data(perf,reportingEntityName,sourceName,kpi_names=None):
+    if perf is None:
+        raise ValueError("PERF3GPP message is empty")
+    metrics = []
+    measurement = "hvves_data"
+    for measInfo in perf.measDataCollection.measInfo:
+        for measValue in measInfo.measValues:
+            try:
+                num_of_sectors = int(
+                    measValue.measObjAddlFlds.get(
+                        "num_of_sectors",
+                        1
+                    )
+                )
+            except (ValueError, TypeError):
+                num_of_sectors = 1
+
+            if num_of_sectors < 1:
+                raise ValueError("Invalid number of sectors")
+
+            meas_results = measValue.measResults
+
+            result_count = len(meas_results)
+            if kpi_names:
+                names = list(kpi_names)
+                values_per_sector = len(names)
+            else:
+                if result_count % num_of_sectors != 0:
+                    raise ValueError(
+                        "Cannot determine KPI positions per sector"
+                    )
+                values_per_sector = (
+                    result_count // num_of_sectors
+                )
+                names = [
+                    f"kpi_index_{idx}"
+                    for idx in range(values_per_sector)
+                ]
+            for sector in range(num_of_sectors):
+                sector_id = sector + 1
+                offset = sector * values_per_sector
+                for idx, kpi in enumerate(names):
+                    index = offset + idx
+                    if index >= result_count:
+                        break
+                    result = meas_results[index]
+                    if result.HasField("iValue"):
+                        value = result.iValue
+                    elif result.HasField("rValue"):
+                        value = result.rValue
+                    else:
+                        continue
+                    metrics.append({
+                        "measurement": measurement,
+                        "tags": {
+                            "kpiname": kpi,
+                            "sourcename": sourceName,
+                            "sector": sector_id
+                        },
+                        "fields": {
+                            "kpivalue": value
+                        }
+                    })
+
+    return metrics
+def transform_to_line_protocol(metric):
+    measurement = metric["measurement"]
+    def escape_tag(value):
+        return (
+            str(value)
+            .replace("\\", "\\\\")
+            .replace(",", "\\,")
+            .replace(" ", "\\ ")
+            .replace("=", "\\=")
+        )
+    def escape_measurement(value):
+        return (
+            str(value)
+            .replace("\\", "\\\\")
+            .replace(",", "\\,")
+            .replace(" ", "\\ ")
+        )
+    tags = ",".join(
+        f"{escape_tag(k)}={escape_tag(v)}"
+        for k, v in metric["tags"].items()
+    )
+
+def decode_perf(encoded_data):
+    try:
+        if not isinstance(encoded_data, bytes):
+            raise TypeError(
+                "Encoded data must be bytes"
+            )
+        if not encoded_data:
+            raise ValueError(
+                "Encoded data is empty"
+            )
+        decoded_data = decode_perf_event(
+            payload=encoded_data,
+            reportingEntityName="unknown",
+            sourceName="unknown",
+            kpi_names=None
+        )
+        return decoded_data
+    except Exception as error:
         raise RuntimeError(
             f"PERF3GPP decode failed: {error}"
-        )
-def prepare_failed_decode_message(
-    failed_message,
-):
-
+        ) from error
+def prepare_failed_decode_message(failed_message,):
     record = {
-
         "consumer_id":
             failed_message["consumer_id"],
-
         "topic":
             failed_message["topic"],
-
         "partition":
             failed_message["partition"],
-
         "offset":
             failed_message["offset"],
-
         "encoded_data":
             base64.b64encode(
                 failed_message["encoded_data"]
             ).decode("utf-8"),
-
         "error":
             failed_message["error"],
     }
-
     return json.dumps(record) + "\n"
-
-def store_failed_decode_batch(
-    records,
-):
-
+def store_failed_decode_batch(records,):
     with open(
         FAILED_DECODE_FILE,
         "a",
         encoding="utf-8",
     ) as file:
-
         file.writelines(records)
-async def flush_failed_decode_batch(
-    batch,
-    failed_decode_queue,
-):
-
+async def flush_failed_decode_batch(batch,failed_decode_queue,):
     if not batch:
         return
-
     records = [
 
         prepare_failed_decode_message(
@@ -127,27 +262,20 @@ async def flush_failed_decode_batch(
 
         for failed_message in batch
     ]
-
     await asyncio.to_thread(
         store_failed_decode_batch,
         records,
     )
-
     for _ in batch:
-
         failed_decode_queue.task_done()
-
     logger.info(
         "Failed decode batch written | "
         "count=%s | file=%s",
         len(batch),
         FAILED_DECODE_FILE,
     )
-
 async def failed_decode_writer(failed_decode_queue,):
-    logger.info(
-        "Failed Decode Writer started"
-    )
+    logger.info("Failed Decode Writer started")
     batch = []
     loop = asyncio.get_running_loop()
     last_flush_time = loop.time()
@@ -157,37 +285,27 @@ async def failed_decode_writer(failed_decode_queue,):
                 loop.time()
                 - last_flush_time
             )
-
             remaining_time = max(
                 0,
                 FAILED_DECODE_FLUSH_INTERVAL
                 - elapsed_time,
             )
-
             try:
-
                 failed_message = (
                     await asyncio.wait_for(
                         failed_decode_queue.get(),
                         timeout=remaining_time,
                     )
                 )
-
                 batch.append(
                     failed_message
                 )
-
             except asyncio.TimeoutError:
-
                 pass
-
-
             batch_full = (
                 len(batch)
                 >= FAILED_DECODE_BATCH_SIZE
             )
-
-
             flush_timeout = (
                 batch
                 and (
@@ -196,13 +314,10 @@ async def failed_decode_writer(failed_decode_queue,):
                     >= FAILED_DECODE_FLUSH_INTERVAL
                 )
             )
-
-
             if (
                 batch_full
                 or flush_timeout
             ):
-
                 try:
 
                     await flush_failed_decode_batch(
@@ -251,13 +366,10 @@ async def check_kafka_health():
         try:
 
             health_client = AIOKafkaProducer(
-                bootstrap_servers=(
-                    KAFKA_BOOTSTRAP_SERVERS
-                ),
-                client_id=(
-                    "perf3gpp-health-check"
-                ),
+                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                client_id="perf3gpp-health-check",
                 request_timeout_ms=5000,
+                **KAFKA_SECURITY_CONFIG,
             )
 
             await asyncio.wait_for(
@@ -268,19 +380,13 @@ async def check_kafka_health():
             logger.info(
                 "Kafka is reachable"
             )
-
             return
-
-
         except asyncio.CancelledError:
 
             logger.info(
                 "Kafka health check cancelled"
             )
-
             raise
-
-
         except Exception as error:
 
             logger.warning(
@@ -290,44 +396,25 @@ async def check_kafka_health():
                 error,
                 retry_backoff,
             )
-
-
         finally:
-
             if health_client is not None:
-
                 try:
-
-                    await health_client.stop()
-
+                   await health_client.stop()
                 except Exception:
-
                     pass
-
-
         await asyncio.sleep(
             retry_backoff
         )
-
-
         retry_backoff = min(
             retry_backoff * 2,
             MAX_RETRY_BACKOFF,
         )
-async def kafka_consumer_worker(
-    process_pool,
-    memory_buffer,
-    failed_decode_queue,
-    kafka_failure_event,
-):
+async def kafka_consumer_worker(process_pool,memory_buffer,failed_decode_queue,kafka_failure_event,):
     logger.info(
         "Kafka Consumer Worker started"
     )
-
     consumer = None
-
     try:
-
         consumer = AIOKafkaConsumer(
             INPUT_TOPIC,
             bootstrap_servers=(
@@ -337,6 +424,7 @@ async def kafka_consumer_worker(
             enable_auto_commit=False,
             auto_offset_reset="earliest",
             client_id=CONSUMER_ID,
+            **KAFKA_SECURITY_CONFIG,
         )
         await consumer.start()
         logger.info(
@@ -377,6 +465,12 @@ async def kafka_consumer_worker(
                                 decode_perf,
                                 encoded_data,
                             )
+                        )
+                        logger.info(
+                            "Decoded message | partition=%s | offset=%s | data=%s",
+                            message.partition,
+                            message.offset,
+                            json.dumps(decoded_data, indent=2),
                         )
                         decoded_message = {
                             "consumer_id":CONSUMER_ID,
@@ -466,8 +560,6 @@ async def kafka_consumer_worker(
         logger.info(
             "Kafka Consumer Worker stopped"
         )
-
-
 async def kafka_producer_worker(memory_buffer,retry_queue,kafka_failure_event,):
     logger.info("Kafka Producer Worker started")
     producer = None
@@ -486,6 +578,7 @@ async def kafka_producer_worker(memory_buffer,retry_queue,kafka_failure_event,):
             ),
             request_timeout_ms=30000,
             retry_backoff_ms=500,
+            **KAFKA_SECURITY_CONFIG,
         )
         await producer.start()
         logger.info(
@@ -579,8 +672,6 @@ async def kafka_producer_worker(memory_buffer,retry_queue,kafka_failure_event,):
                     "error=%s",
                     error,
                 )
-
-
                 await retry_queue.put(
                     {
                         "message":
@@ -596,15 +687,9 @@ async def kafka_producer_worker(memory_buffer,retry_queue,kafka_failure_event,):
                             0,
                     }
                 )
-
-
                 memory_buffer.task_done()
-
                 current_item = None
-
-
-            except Exception as error:
-
+            except Exception as error
                 logger.exception(
                     "Unexpected Producer error | "
                     "error=%s",
@@ -715,6 +800,7 @@ async def kafka_retry_worker(retry_queue):
         max_batch_size=PRODUCER_MAX_BATCH_SIZE,
         request_timeout_ms=30000,
         retry_backoff_ms=500,
+        **KAFKA_SECURITY_CONFIG,
     )
 
     await producer.start()
@@ -792,13 +878,7 @@ async def kafka_retry_worker(retry_queue):
         logger.info(
             "Kafka Retry Worker stopped"
         )
-def start_workers(
-    process_pool,
-    memory_buffer,
-    retry_queue,
-    failed_decode_queue,
-    kafka_failure_event,
-):
+def start_workers(process_pool,memory_buffer,retry_queue,failed_decode_queue,kafka_failure_event,):
 
     logger.info(
         "Starting Kafka workers"
@@ -812,8 +892,6 @@ def start_workers(
         ),
         name="kafka-consumer-worker",
     )
-
-
     producer_worker = asyncio.create_task(
         kafka_producer_worker(
             memory_buffer,
@@ -932,22 +1010,11 @@ async def wait_for_worker_failure(workers,kafka_failure_event,):
             except asyncio.CancelledError:
                 pass
 
-async def supervisor(
-    process_pool,
-    memory_buffer,
-    retry_queue,
-    failed_decode_queue,
-    kafka_failure_event,
-):
-
+async def supervisor(process_pool,memory_buffer,retry_queue,failed_decode_queue,kafka_failure_event,):
     logger.info("Supervisor started")
-
     workers = []
-
     try:
-
         while True:
-
             await check_kafka_health()
             workers = start_workers(
                 process_pool,
@@ -960,7 +1027,6 @@ async def supervisor(
                 workers,
                 kafka_failure_event,
             )
-
             logger.warning(
                 "Restarting workers | reason=%s",
                 reason,

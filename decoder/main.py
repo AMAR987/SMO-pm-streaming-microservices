@@ -3,7 +3,7 @@ import logging
 
 from concurrent.futures import ProcessPoolExecutor
 
-from utils import (
+from util import (
     supervisor,
     failed_decode_writer,
     stop_worker,
@@ -57,6 +57,9 @@ async def main():
             retry_queue,
             failed_decode_queue,
             kafka_failure_event,
+        )
+        logger.info(
+            "PERF3GPP Decoder completed"
         )
 
     except asyncio.CancelledError:
