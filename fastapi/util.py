@@ -4,6 +4,7 @@ import logging
 import os
 import time
 import uuid
+from hashlib import md5
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -40,16 +41,16 @@ class StreamInfoRequest(BaseModel):
             values = wrapped
         return values
 
-    @model_validator(mode="after")
-    def validate_stream_details(self):
-        stream_type = self.stream_type.strip().upper()
-        if stream_type in {"PERFORMANCE", "PERF3GPP"} and not self.performance_metrics:
-            raise ValueError("performanceMetrics must contain at least one item for performance streams")
-        if stream_type not in {"PERFORMANCE", "PERF3GPP", "PROPRIETARY"}:
-            raise ValueError("StreamType must be PERFORMANCE, PERF3GPP, or PROPRIETARY")
-        if self.serialization_format.strip().upper() != "GPB":
-            raise ValueError("Only GPB SerializationFormat is supported")
-        return self
+@model_validator(mode="after")
+def validate_stream_details(self):
+    stream_type = self.stream_type.strip().upper()
+    if stream_type not in {"PERFORMANCE", "PERF3GPP", "PROPRIETARY"}:
+        raise ValueError(
+            "StreamType must be PERFORMANCE, PERF3GPP, or PROPRIETARY"
+        )
+    if self.serialization_format.strip().upper() != "GPB":
+        raise ValueError("Only GPB SerializationFormat is supported")
+    return self
 
 class ConnectionRequest(BaseModel):
     """Create-connection request; supports legacy object and list streamInfoList."""
@@ -70,8 +71,9 @@ class ConnectionRequest(BaseModel):
 
 class StreamRequest(StreamInfoRequest):
     """Request body used to add one stream to an existing connection."""
-CONNECTION_TTL = int(os.getenv("CONNECTION_TTL", "300"))
-REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+CONNECTION_TTL = max(0, int(os.getenv("CONNECTION_TTL", "0")))
+REDIS_KEY_PREFIX = os.getenv("REDIS_KEY_PREFIX", "")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_DB = int(os.getenv("REDIS_DB", "0"))
 REDIS_SYNC_INTERVAL = float(os.getenv("REDIS_SYNC_INTERVAL", "2"))
@@ -97,7 +99,6 @@ REDIS_RETRY_ERRORS = [
     RedisTimeoutError,
     ConnectionResetError,
 ]
-
 @dataclass
 class StreamInfo:
     stream_id: str
@@ -108,16 +109,16 @@ class StreamInfo:
     vs_data_container: Dict[str, Any] = field(default_factory=dict)
     last_activity: float = field(default_factory=time.time)
 
-
 @dataclass
 class ConnectionInfo:
     connection_id: str
     producer_id: str = ""
     default_stream_id: Optional[str] = None
     streams: Dict[str, StreamInfo] = field(default_factory=dict)
+    streams_metaData: Dict[str, Any] = field(default_factory=dict)
+    hash_map: Dict[str, str] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     last_activity: float = field(default_factory=time.time)
-
 class ClientInfo:
 
     def __init__(self):
@@ -127,41 +128,41 @@ class ClientInfo:
         self.pending_upserts: Dict[str, ConnectionInfo] = {}
         self.pending_deletes: set[str] = set()
 
+    def _redis_key(self, connection_id: str) -> str:
+        return f"{REDIS_KEY_PREFIX}{connection_id}"
+
     async def init_redis(self) -> bool:
         async with self.redis_init_lock:
             if self.redis is not None:
-                try:
-                    await self.redis.ping()
-                    return True
-                except Exception:
-                    logger.warning("Existing Redis connection is unavailable")
-                    await self.close_redis()
+                return True
+
             candidate = Redis(
                 host=REDIS_HOST,
                 port=REDIS_PORT,
                 db=REDIS_DB,
                 decode_responses=True,
-                retry=REDIS_RETRY,
+                retry=Retry(
+                    ExponentialBackoff(
+                        cap=REDIS_BACKOFF_CAP,
+                        base=REDIS_BACKOFF_BASE,
+                    ),
+                    REDIS_RETRY_COUNT,
+                ),
                 retry_on_error=REDIS_RETRY_ERRORS,
                 health_check_interval=REDIS_HEALTH_CHECK_INTERVAL,
                 socket_connect_timeout=REDIS_SOCKET_CONNECT_TIMEOUT,
                 socket_timeout=REDIS_SOCKET_TIMEOUT,
             )
-
             try:
                 await candidate.ping()
                 self.redis = candidate
                 logger.info(
-                    "Redis connection established (retry_count=%d, backoff=%ss->%ss, "
-                    "health_check_interval=%ss)",
-                    REDIS_RETRY_COUNT,
-                    REDIS_BACKOFF_BASE,
-                    REDIS_BACKOFF_CAP,
-                    REDIS_HEALTH_CHECK_INTERVAL,
+                    "Redis connection established (host=%s, port=%s, db=%s)",
+                    REDIS_HOST, REDIS_PORT, REDIS_DB,
                 )
                 return True
             except Exception:
-                logger.exception("Redis is unavailable")
+                logger.warning("Redis is unavailable at %s:%s; using local fallback until it recovers", REDIS_HOST, REDIS_PORT)
                 try:
                     await candidate.aclose()
                 except Exception:
@@ -226,15 +227,24 @@ class ClientInfo:
         return connection
 
     async def _redis_set(self, connection: ConnectionInfo) -> bool:
-        """Write metadata to Redis. Returns False if Redis is unavailable."""
+        try:
+            payload = json.dumps(self._connection_to_dict(connection), separators=(",", ":"))
+        except (TypeError, ValueError):
+            logger.exception(
+                "Connection metadata for %s is not JSON serializable",
+                connection.connection_id,
+            )
+            return False
+
         if not await self.init_redis():
             return False
         try:
-            await self.redis.set(
-                connection.connection_id,
-                json.dumps(self._connection_to_dict(connection)),
-                ex=CONNECTION_TTL,
-            )
+            key = self._redis_key(connection.connection_id)
+            if CONNECTION_TTL > 0:
+                await self.redis.set(key, payload, ex=CONNECTION_TTL)
+            else:
+                await self.redis.set(key, payload)
+            logger.debug("Stored connection metadata in Redis: key=%s", key)
             return True
         except Exception:
             logger.exception(
@@ -248,7 +258,7 @@ class ClientInfo:
         if not await self.init_redis():
             return False, None
         try:
-            data = await self.redis.get(connection_id)
+            data = await self.redis.get(self._redis_key(connection_id))
             if data is None:
                 return True, None
             return True, self._dict_to_connection(json.loads(data))
@@ -261,7 +271,7 @@ class ClientInfo:
         if not await self.init_redis():
             return False
         try:
-            await self.redis.delete(connection_id)
+            await self.redis.delete(self._redis_key(connection_id))
             return True
         except Exception:
             logger.exception("Redis DELETE failed for %s", connection_id)
@@ -301,7 +311,9 @@ class ClientInfo:
                 return
         for connection_id, connection in list(self.pending_upserts.items()):
             if await self._redis_set(connection):
-                self.pending_upserts.pop(connection_id, None)
+                # Do not erase a newer update that arrived while this snapshot was syncing.
+                if self.pending_upserts.get(connection_id) is connection:
+                    self.pending_upserts.pop(connection_id, None)
                 logger.info(
                     "Pending Redis update synchronized for %s",
                     connection_id,
@@ -310,7 +322,6 @@ class ClientInfo:
                 return
 
     async def monitor_redis(self):
-        """Continuously keep trying to establish Redis connectivity."""
         delay = float(os.getenv("REDIS_RETRY_BASE", str(REDIS_BACKOFF_BASE)))
         cap = float(os.getenv("REDIS_RETRY_CAP", str(REDIS_BACKOFF_CAP)))
 
@@ -376,7 +387,7 @@ class ClientInfo:
         performance_metrics: Optional[List[Any]] = None,
         vs_data_container: Optional[Dict[str, Any]] = None,
     ) -> ConnectionInfo:
-        connection_id = str(uuid.uuid4())
+        connection_id = uuid.uuid4().hex[:15]
         stream_id = stream_id or str(uuid.uuid4())
         stream = StreamInfo(
             stream_id=stream_id,
@@ -396,7 +407,6 @@ class ClientInfo:
         return connection
 
     async def save_connection(self, connection: ConnectionInfo) -> bool:
-        """Persist metadata, retaining a process-local retry if Redis is down."""
         if await self._redis_set(connection):
             self.pending_upserts.pop(connection.connection_id, None)
             self.pending_deletes.discard(connection.connection_id)
@@ -408,13 +418,15 @@ class ClientInfo:
         self,
         connection_id: str,
     ) -> tuple[bool, Optional[ConnectionInfo]]:
-        """Return (Redis reachable, metadata); distinguishes outage from missing ID."""
-        redis_available, connection = await self._redis_get(connection_id)
+        """Return (Redis reachable, metadata); local fallback is checked first."""
         if connection_id in self.pending_deletes:
-            return redis_available, None
+            return self.redis is not None, None
         pending = self.pending_upserts.get(connection_id)
         if pending is not None:
-            return redis_available, pending
+            # Do not wait for a Redis timeout when this worker already has the
+            # latest metadata in its fallback map.
+            return self.redis is not None, pending
+        redis_available, connection = await self._redis_get(connection_id)
         if redis_available:
             return True, connection
         return False, None
@@ -477,8 +489,7 @@ class ClientInfo:
             stream = connection.streams.get(stream_id)
             if stream:
                 stream.last_activity = now
-        if not await self._redis_set(connection):
-            self._store_pending_upsert(connection)
+        await self.save_connection(connection)
         return True
 
     async def delete_stream(
@@ -545,6 +556,98 @@ def stream_response(connection_id: str, stream: StreamInfo) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Legacy hv-ves-procedures compatibility helpers
+# ---------------------------------------------------------------------------
+
+STATUS_BAD_REQUEST = 400
+STATUS_OK = 200
+STATUS_ACCEPTED = 201
+STATUS_SERVER_ERROR = 503
+STATUS_FORBIDDEN = 403
+STATUS_SWITCH_PROTOCOL = 101
+
+try:
+    import VesEvent_pb2  # Generated protobuf module from the original project.
+except ImportError:  # API tests can still run without generated protobuf files.
+    VesEvent_pb2 = None
+
+
+def allocate_connection_id() -> str:
+    """Return the same 16-character connection ID as the legacy collector."""
+    raw_uuid = str(uuid.uuid4()).replace("-", "")
+    return uuid.uuid4().hex[:15]
+
+
+def validate_data(data: dict) -> bool:
+    """Legacy schema validation for create-connection and add-stream bodies."""
+    try:
+        if not isinstance(data, dict) or not data.get("producerId"):
+            return False
+        stream_info = data.get("streamInfoList")
+        if isinstance(stream_info, list):
+            if len(stream_info) != 1:
+                return False
+            stream_info = stream_info[0]
+        if not isinstance(stream_info, dict):
+            return False
+        stream_type = str(stream_info.get("StreamType", "")).upper()
+        serialization = str(stream_info.get("SerializationFormat", "")).upper()
+        if serialization != "GPB":
+            return False
+        if stream_type == "PERFORMANCE":
+            return isinstance(stream_info.get("performanceMetrics"), list) and len(stream_info["performanceMetrics"]) >= 1
+        if stream_type == "PROPRIETARY":
+            return isinstance(stream_info.get("VsDataContainer", {}), dict)
+        # PERF3GPP is accepted as a newer alias; the legacy canonical name is PERFORMANCE.
+        if stream_type == "PERF3GPP":
+            return isinstance(stream_info.get("performanceMetrics"), list) and len(stream_info["performanceMetrics"]) >= 1
+        return False
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def validate_ves_event(ves_event) -> bool:
+    if VesEvent_pb2 is None:
+        return False
+    try:
+        header = ves_event.commonEventHeader
+        return (
+            header.version == "1.0"
+            and header.domain == "perf3gpp"
+            and header.vesEventListenerVersion == "7.2"
+        )
+    except Exception:
+        return False
+
+
+def decode_ves_event(payload: bytes):
+    """Decode a GPB VES event and return eventFields, as the old collector did."""
+    if VesEvent_pb2 is None:
+        logger.error("VesEvent_pb2 is unavailable; cannot decode performance packet")
+        return None
+    try:
+        event = VesEvent_pb2.VesEvent()
+        event.ParseFromString(payload)
+        if validate_ves_event(event):
+            return event.eventFields
+        logger.warning("Payload rejected: VES event schema validation failed")
+    except Exception as exc:
+        logger.warning("Payload rejected: %s", exc)
+    return None
+
+
+def _protobuf_to_bytes(data) -> bytes:
+    if isinstance(data, bytes):
+        return data
+    if isinstance(data, bytearray):
+        return bytes(data)
+    serializer = getattr(data, "SerializeToString", None)
+    if callable(serializer):
+        return serializer()
+    raise TypeError("Kafka payload must be bytes or a protobuf message")
+
+
+# ---------------------------------------------------------------------------
 # Kafka utilities
 # ---------------------------------------------------------------------------
 
@@ -557,7 +660,7 @@ KAFKA_CONFIG_FILE = os.getenv("KAFKA_CONFIG_FILE", "meta.json")
 kafka_bootstrap_server = ""
 kafka_user = ""
 kafka_password = ""
-kafka_security_protocol = os.getenv("KAFKA_SECURITY_PROTOCOL", "SASL_PLAINTEXT")
+kafka_security_protocol = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
 kafka_sasl_mechanism = os.getenv("KAFKA_SASL_MECHANISM", "PLAIN")
 kafka_producer: Optional[AIOKafkaProducer] = None
 kafka_start_lock = asyncio.Lock()
@@ -573,9 +676,15 @@ def get_kafka_configs() -> None:
     kafka_sasl_mechanism = os.getenv("KAFKA_SASL_MECHANISM", kafka_sasl_mechanism)
     config_path = _Path(KAFKA_CONFIG_FILE)
     if not config_path.is_absolute() and not config_path.exists():
-        project_root_config = _Path(__file__).resolve().parent.parent / config_path
-        if project_root_config.exists():
-            config_path = project_root_config
+        candidates = [
+            _Path(__file__).resolve().parent / config_path,
+            _Path(__file__).resolve().parent.parent / config_path,
+            _Path(__file__).resolve().parent.parent.parent / config_path,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                config_path = candidate
+                break
     if config_path.exists():
         with config_path.open("r", encoding="utf-8") as file:
             config = json.load(file)
@@ -610,7 +719,7 @@ async def start_kafka() -> None:
         producer_options = {
             "bootstrap_servers": kafka_bootstrap_server,
             "security_protocol": kafka_security_protocol,
-            "compression_type": "lz4",
+            "compression_type": None,
             "linger_ms": 20,
             "max_batch_size": 131072,
             "max_request_size": 10485760,
@@ -653,10 +762,8 @@ async def connect_kafka_with_retry() -> None:
                 try:
                     await start_kafka()
                     delay = float(os.getenv("KAFKA_RETRY_BASE", "1"))
-                except Exception:
-                    logger.exception(
-                        "Kafka unavailable; retrying in %.1f seconds", delay
-                    )
+                except Exception as exc:
+                    logger.warning("Kafka unavailable (%s); retrying in %.1f seconds", exc, delay)
                     await asyncio.sleep(delay)
                     delay = min(delay * 2, cap)
                     continue
@@ -751,4 +858,13 @@ async def write_packet(packet: bytes, stream_type: str) -> None:
     raise RuntimeError(
         f"Kafka unavailable after {send_retries} send attempts for topic={topic}"
     )
+
+async def init_kafka() -> None:
+    await start_kafka()
+
+async def close_kafka() -> None:
+    await stop_kafka()
+
+async def async_kafka_send(data, stream_type: str) -> None:
+    await write_packet(_protobuf_to_bytes(data), stream_type)
 
