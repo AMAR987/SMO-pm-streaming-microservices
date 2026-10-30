@@ -22,6 +22,53 @@ class CommitState:
         self.last_committed_next = {}
 
 
+async def collect_pending_acks(ack_queue, commit_state):
+    while True:
+        try:
+            ack = ack_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+        commit_state.pending_acks.append(ack)
+        ack_queue.task_done()
+
+
+async def get_message_batch(memory_buffer, batch_size):
+    batch = [await memory_buffer.get()]
+
+    while len(batch) < batch_size:
+        try:
+            message_data = memory_buffer.queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+
+        batch.append(message_data)
+
+    return batch
+
+
+async def write_batch_with_retry(write_api, batch, config):
+    messages = [item["message"] for item in batch]
+
+    while True:
+        success = await write_to_influx(
+            write_api,
+            messages,
+            config,
+        )
+
+        if success:
+            return
+
+        print(
+            f"[INFLUX] Batch write failed for "
+            f"{len(batch)} messages. Retrying...",
+            flush=True,
+        )
+
+        await asyncio.sleep(config.get("retry_delay", 5))
+
+
 async def kafka_consumer(memory_buffer, ack_queue, commit_state, config):
     consumer = None
 
@@ -37,14 +84,7 @@ async def kafka_consumer(memory_buffer, ack_queue, commit_state, config):
 
         while True:
 
-            while True:
-                try:
-                    ack = ack_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                else:
-                    commit_state.pending_acks.append(ack)
-                    ack_queue.task_done()
+            await collect_pending_acks(ack_queue, commit_state)
 
             if commit_state.pending_acks:
                 ack = commit_state.pending_acks[0]
@@ -146,31 +186,18 @@ async def influx_writer(memory_buffer, ack_queue, config):
         batch_size = config.get("batch_size", 100)
 
         while True:
-            
-            batch = [await memory_buffer.get()]
+            batch = await get_message_batch(
+                memory_buffer,
+                batch_size,
+            )
 
-            while len(batch) < batch_size:
-                try:
-                    message_data = memory_buffer.queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-
-                batch.append(message_data)
 
             try:
-                messages = [
-                    item["message"]
-                    for item in batch
-                ]
-
-                success = await write_to_influx(
+                await write_batch_with_retry(
                     write_api,
-                    messages,
+                    batch,
                     config,
                 )
-
-                if not success:
-                    raise RuntimeError("InfluxDB batch write failed")
 
                 print(
                     f"[INFLUX] Batch write succeeded: "
@@ -178,7 +205,6 @@ async def influx_writer(memory_buffer, ack_queue, config):
                     flush=True,
                 )
 
-        
                 for item in batch:
                     await ack_queue.put({
                         "topic": item["topic"],
@@ -186,22 +212,9 @@ async def influx_writer(memory_buffer, ack_queue, config):
                         "offset": item["offset"],
                     })
 
+
             except asyncio.CancelledError:
                 raise
-
-            except Exception as error:
-                print(
-                    f"[INFLUX] Batch processing failed: {error}. "
-                    "Re-queueing messages.",
-                    flush=True,
-                )
-
-                for item in reversed(batch):
-                    await memory_buffer.put(item)
-
-                await asyncio.sleep(
-                    config.get("retry_delay", 5)
-                )
 
             finally:
                 for _ in batch:
