@@ -1,39 +1,34 @@
 import asyncio
-from contextlib import asynccontextmanager
 import logging
 import sys
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from typing import Any
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
+FASTAPI_DIR = Path(__file__).resolve().parent
+for import_path in (str(FASTAPI_DIR), str(PROJECT_ROOT)):
+    if import_path not in sys.path:
+        sys.path.insert(0, import_path)
 try:
     import util as utils
 except ImportError as exc:
-    raise ImportError("Unable to import util.py beside main.py") from exc
-
+    raise ImportError("Unable to import util.py from the FastAPI project directory") from exc
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("hv-ves-fastapi")
 db = utils.ClientInfo()
-redis_monitor_task = None
-kafka_monitor_task = None
+redis_monitor_task: asyncio.Task | None = None
+kafka_monitor_task: asyncio.Task | None = None
 
-@asynccontextmanager
-async def lifespan(_app):
-    await startup()
-    try:
-        yield
-    finally:
-        await shutdown()
-app = FastAPI(title="HV-VES Ingestion", version="1.0.0", lifespan=lifespan)
+# Refresh Redis metadata every minute while a WebSocket is active. Each refresh
+# resets the Redis key expiry to exactly 300 seconds.
+METADATA_REFRESH_SECONDS = 60
 
 async def _request_json(request: Request) -> dict[str, Any]:
     try:
@@ -47,190 +42,149 @@ def _validate(model, body):
         return model.model_validate(body)
     return model.parse_obj(body)
 
-async def startup():
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
     global redis_monitor_task, kafka_monitor_task
-    logger.info("Starting HV-VES ingestion service")
+    logger.info("Starting HV-VES ingestion service | PID=%s", __import__("os").getpid())
+    # Start both Redis recovery loops before serving requests. The initial
+    # connection attempt is non-fatal; monitor_redis retries indefinitely.
+    redis_connected = await db.init_redis()
+    if redis_connected:
+        logger.info("Redis startup check succeeded")
+    else:
+        logger.warning("Redis is unavailable at startup; background reconnect is active")
+
     db.start_redis_sync()
-    redis_monitor_task = asyncio.create_task(db.monitor_redis())
-    kafka_monitor_task = asyncio.create_task(utils.connect_kafka_with_retry())
-    logger.info("HV-VES ingestion service started; Redis/Kafka recovery runs in background")
+    redis_monitor_task = asyncio.create_task(
+        db.monitor_redis(), name="redis-monitor"
+    )
+    kafka_monitor_task = asyncio.create_task(
+        utils.connect_kafka_with_retry(), name="kafka-monitor"
+    )
+    try:
+        yield
+    finally:
+        logger.info("Shutting down HV-VES ingestion service")
+        tasks = [t for t in (redis_monitor_task, kafka_monitor_task) if t is not None]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        redis_monitor_task = None
+        kafka_monitor_task = None
+        await db.stop_redis_sync()
+        await utils.stop_kafka()
+        logger.info("HV-VES ingestion service stopped")
 
-async def shutdown():
-    global redis_monitor_task, kafka_monitor_task
-    logger.info("Shutting down HV-VES ingestion service")
-    tasks = [task for task in (redis_monitor_task, kafka_monitor_task) if task is not None]
-    for task in tasks:
-        task.cancel()
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-    redis_monitor_task = None
-    kafka_monitor_task = None
-    await db.stop_redis_sync()
-    await utils.stop_kafka()
-    logger.info("HV-VES ingestion service stopped")
+app = FastAPI(title="HV-VES Ingestion", version="1.0.0", lifespan=lifespan)
 
+@app.get("/health")
+async def health():
+    redis_ok = await db.init_redis()
+    return JSONResponse(
+        status_code=200 if redis_ok else 503,
+        content={
+            "status": "ok" if redis_ok else "degraded",
+            "redis": "connected" if redis_ok else "unavailable",
+            "redis_pending_writes": len(db.pending_upserts),
+            "redis_pending_deletes": len(db.pending_deletes),
+            "connection_ttl_seconds": utils.CONNECTION_TTL,
+        },
+    )
 
 @app.post("/connections")
 async def create_connection(request: Request):
-    """Create a connection and preserve the legacy v1.0 success response."""
     body = await _request_json(request)
     try:
         parsed = _validate(utils.ConnectionRequest, body)
     except (ValidationError, ValueError, TypeError) as exc:
-        message = (
-            "Either no data was provided or the data sent has error."
-            if not body
-            else "Data does not conform to schema"
-        )
         logger.info("Connection request rejected: %s", exc)
-        return JSONResponse(
-            status_code=400,
-            content={"errorReason": message},
-        )
-    # Reject duplicate stream IDs without building a separate stream_ids list.
-    seen_stream_ids = set()
-    for stream_info in parsed.stream_info_list:
-        if stream_info.stream_id in seen_stream_ids:
-            return JSONResponse(
-                status_code=400,
-                content={"errorReason": "Data does not conform to schema"},
-            )
-        seen_stream_ids.add(stream_info.stream_id)
-    first_stream = parsed.stream_info_list[0]
-    connection = await db.create_connection(
-        stream_type=utils.validate_stream_request(first_stream),
-        serialization_format=first_stream.serialization_format,
-        stream_id=first_stream.stream_id,
-        producer_id=parsed.producer_id,
-        meas_obj_dn=first_stream.meas_obj_dn,
-        performance_metrics=first_stream.performance_metrics,
-        vs_data_container=first_stream.vs_data_container,
-    )
-    for stream_info in parsed.stream_info_list[1:]:
-        connection.streams[stream_info.stream_id] = utils.StreamInfo(
-            stream_id=stream_info.stream_id,
-            stream_type=utils.validate_stream_request(stream_info),
-            serialization_format=stream_info.serialization_format,
-            meas_obj_dn=stream_info.meas_obj_dn,
-            performance_metrics=stream_info.performance_metrics,
-            vs_data_container=stream_info.vs_data_container,
-        )
-    if len(parsed.stream_info_list) > 1:
-        await db.save_connection(connection)
-    logger.info(
-        "Connection created | ConnectionID=%s StreamID=%s",
-        connection.connection_id,
-        first_stream.stream_id,
-    )
-    return JSONResponse(
-        status_code=201,
-        headers={"location": f"/connections/{connection.connection_id}"},
-        content={"Info": "Connection to hv-ves has been accepted."},
-    )
+        message = "Either no data was provided or the data sent has error." if not body else "Data does not conform to schema"
+        return JSONResponse(status_code=400, content={"errorReason": message})
 
+    first = parsed.stream_info_list[0]
+    try:
+        connection = await db.create_connection(
+            stream_type=utils.validate_stream_request(first),
+            serialization_format=first.serialization_format,
+            stream_id=first.stream_id,
+            producer_id=parsed.producer_id,
+            meas_obj_dn=first.meas_obj_dn,
+            performance_metrics=first.performance_metrics,
+            vs_data_container=first.vs_data_container,
+        )
+        # Add any additional streams and persist the complete metadata again.
+        for item in parsed.stream_info_list[1:]:
+            if item.stream_id in connection.streams:
+                raise ValueError(f"Duplicate streamId: {item.stream_id}")
+            connection.streams[item.stream_id] = utils.StreamInfo(
+                stream_id=item.stream_id,
+                stream_type=utils.validate_stream_request(item),
+                serialization_format=item.serialization_format,
+                meas_obj_dn=item.meas_obj_dn,
+                performance_metrics=item.performance_metrics,
+                vs_data_container=item.vs_data_container,
+            )
+        if len(parsed.stream_info_list) > 1 and not await db.save_connection(connection):
+            db.pending_upserts.pop(connection.connection_id, None)
+            logger.error("Could not persist all streams for connection %s", connection.connection_id)
+            return JSONResponse(status_code=503, content={"errorReason": "Redis metadata persistence failed; retry the request."})
+    except utils.RedisPersistenceError as exc:
+        logger.error("Connection creation failed: %s", exc)
+        return JSONResponse(status_code=503, content={"errorReason": "Redis is unavailable; connection was not created. Retry the request."})
+    except (ValidationError, ValueError, TypeError) as exc:
+        logger.info("Connection request rejected: %s", exc)
+        return JSONResponse(status_code=400, content={"errorReason": "Data does not conform to schema"})
+
+    logger.info(
+        "CONNECTION_CREATED_AND_PERSISTED | ConnectionID=%s DefaultStreamID=%s RedisKey=%s TTL=%s",
+        connection.connection_id, first.stream_id,
+        db._redis_key(connection.connection_id), utils.CONNECTION_TTL,
+    )
+    return JSONResponse(status_code=201, headers={"Location": f"/connections/{connection.connection_id}"}, content={"Info": "Connection to hv-ves has been accepted.", "connection_id": connection.connection_id})
 
 @app.post("/connections/{connection_id}/streams")
 async def create_stream(connection_id: str, request: Request):
     body = await _request_json(request)
-
     try:
         parsed = _validate(utils.StreamRequest, body)
     except (ValidationError, ValueError, TypeError) as exc:
         logger.info("Stream request rejected: %s", exc)
-        return JSONResponse(
-            status_code=400,
-            content={"Error": "Data does not conform to schema."},
-        )
-
-    # Resolve the connection once. If Redis is down, get_connection_lookup()
-    # can still return this worker's local pending-upsert metadata.
+        return JSONResponse(status_code=400, content={"Error": "Data does not conform to schema."})
     redis_available, connection = await db.get_connection_lookup(connection_id)
-
     if connection is None:
         if not redis_available:
-            logger.warning(
-                "Cannot add stream to %s: Redis is unavailable and no local "
-                "connection metadata is available",
-                connection_id,
-            )
-            return JSONResponse(
-                status_code=503,
-                content={"Error": "Connection metadata temporarily unavailable."},
-            )
-        return JSONResponse(
-            status_code=400,
-            content={"Error": "URI entered does not exist."},
-        )
-
+            return JSONResponse(status_code=503, content={"Error": "Connection metadata temporarily unavailable."})
+        return JSONResponse(status_code=404, content={"Error": "Connection id does not exist."})
     if parsed.stream_id in connection.streams:
-        return JSONResponse(
-            status_code=400,
-            content={"Error": "New stream cannot be created."},
+        return JSONResponse(status_code=400, content={"Error": "New stream cannot be created; streamId already exists."})
+    try:
+        stream = await db.add_stream(
+            connection_id=connection_id,
+            stream_type=utils.validate_stream_request(parsed),
+            serialization_format=parsed.serialization_format,
+            stream_id=parsed.stream_id,
+            meas_obj_dn=parsed.meas_obj_dn,
+            performance_metrics=parsed.performance_metrics,
+            vs_data_container=parsed.vs_data_container,
         )
-
-    # Add the stream to the connection already retrieved above. This avoids
-    # doing a second Redis lookup inside db.add_stream(), which could fail
-    # between lookup and update. save_connection() stores a local fallback
-    # update if Redis is unavailable.
-    stream = utils.StreamInfo(
-        stream_id=parsed.stream_id,
-        stream_type=utils.validate_stream_request(parsed),
-        serialization_format=parsed.serialization_format,
-        meas_obj_dn=parsed.meas_obj_dn,
-        performance_metrics=parsed.performance_metrics,
-        vs_data_container=parsed.vs_data_container,
-    )
-    connection.streams[stream.stream_id] = stream
-
-    if not connection.default_stream_id:
-        connection.default_stream_id = stream.stream_id
-
-    saved_to_redis = await db.save_connection(connection)
-    if not saved_to_redis:
-        logger.warning(
-            "Stream %s added to local fallback for connection %s; "
-            "it will sync to Redis when Redis recovers",
-            stream.stream_id,
-            connection_id,
-        )
-
-    logger.info(
-        "Stream added | ConnectionID=%s StreamID=%s",
-        connection_id,
-        stream.stream_id,
-    )
-    return JSONResponse(
-        status_code=200,
-        content={"Info": "Stream successfully added."},
-    )
-
+    except utils.RedisPersistenceError as exc:
+        logger.error("Stream creation failed for %s: %s", connection_id, exc)
+        return JSONResponse(status_code=503, content={"Error": "Redis metadata persistence failed; retry the request."})
+    if stream is None:
+        return JSONResponse(status_code=404, content={"Error": "Connection id does not exist."})
+    logger.info("Stream added | ConnectionID=%s StreamID=%s", connection_id, stream.stream_id)
+    return JSONResponse(status_code=200, content={"Info": "Stream successfully added."})
 
 @app.get("/connections/{connection_id}")
 async def get_connection(connection_id: str):
     redis_available, connection = await db.get_connection_lookup(connection_id)
-
     if connection is None:
         if not redis_available:
-            logger.warning(
-                "GET connection %s: Redis is unavailable and no local metadata "
-                "is available",
-                connection_id,
-            )
-            return JSONResponse(
-                status_code=503,
-                content={"Error": "Connection metadata temporarily unavailable."},
-            )
-        return JSONResponse(
-            status_code=400,
-            content={"Error": "Connection id does not exist."},
-        )
-
-    info = {
-        stream_id: utils.stream_response_fields(stream)
-        for stream_id, stream in connection.streams.items()
-    }
+            return JSONResponse(status_code=503, content={"Error": "Connection metadata temporarily unavailable."})
+        return JSONResponse(status_code=404, content={"Error": "Connection id does not exist."})
+    info = {sid: utils.stream_response_fields(stream) for sid, stream in connection.streams.items()}
     return JSONResponse(status_code=200, content={"info": info})
-
 
 @app.delete("/connections/{connection_id}/streams/{stream_id}")
 async def delete_stream(connection_id: str, stream_id: str):
@@ -238,81 +192,124 @@ async def delete_stream(connection_id: str, stream_id: str):
     if connection is None:
         if not redis_available:
             return JSONResponse(status_code=503, content={"Error": "Connection metadata temporarily unavailable."})
-        return JSONResponse(status_code=400, content={"Error": "Connection id does not exist."})
+        return JSONResponse(status_code=404, content={"Error": "Connection id does not exist."})
     if stream_id not in connection.streams:
-        return JSONResponse(status_code=400, content={"Error": "Stream id cannot be deleted as it does not exist."})
-    if getattr(connection, "default_stream_id", None) == stream_id:
-        return JSONResponse(
-            status_code=400,
-            content={"Error": f"Default stream for {connection_id} cannot be deleted."},
-        )
-    deleted = await db.delete_stream(connection_id, stream_id)
+        return JSONResponse(status_code=404, content={"Error": "Stream id does not exist."})
+    if connection.default_stream_id == stream_id:
+        return JSONResponse(status_code=400, content={"Error": f"Default stream for {connection_id} cannot be deleted."})
+    try:
+        deleted = await db.delete_stream(connection_id, stream_id)
+    except utils.RedisPersistenceError as exc:
+        logger.error("Stream deletion persistence failed: %s", exc)
+        return JSONResponse(status_code=503, content={"Error": "Redis metadata persistence failed; retry the request."})
     if not deleted:
-        return JSONResponse(status_code=400, content={"Error": "Stream id cannot be deleted as it does not exist."})
+        return JSONResponse(status_code=404, content={"Error": "Stream id does not exist."})
     return JSONResponse(status_code=200, content={"Info": f"{stream_id} stream has been deleted successfully."})
 
 
 @app.websocket("/connections/{connection_id}")
 async def websocket_endpoint(websocket: WebSocket, connection_id: str):
+    """Accept a new or reconnecting WebSocket using its connection ID."""
     await websocket.accept()
-    logger.info("WebSocket accepted; resolving metadata for %s", connection_id)
-    lookup_delay = 1.0
-    lookup_cap = 10.0
+    logger.info(
+        "WEBSOCKET_CONNECT_REQUEST | ConnectionID=%s",
+        connection_id,
+    )
+    delay = 1.0
     try:
         while True:
-            redis_available, connection = await db.get_connection_lookup(connection_id)
-            if connection is not None:
-                break
-            if redis_available:
-                logger.warning("WebSocket connection ID not found: %s", connection_id)
-                await websocket.close(code=1008, reason="Connection id does not exist.")
-                return
-            logger.warning(
-                "Connection metadata unavailable for %s because Redis is down; keeping WebSocket open and retrying",
-                connection_id,
+            redis_available, connection = (
+                await db.get_connection_lookup(connection_id)
             )
-            await asyncio.sleep(lookup_delay)
-            lookup_delay = min(lookup_delay * 2, lookup_cap)
-        default_stream_id = getattr(connection, "default_stream_id", None)
-        stream = connection.streams.get(default_stream_id) if default_stream_id else None
-        if stream is None:
-            stream = next(iter(connection.streams.values()), None)
-        if stream is None:
-            logger.error("No stream metadata available for connection %s", connection_id)
-            await websocket.close(code=1008, reason="Stream metadata unavailable")
-            return
-        stream_type = stream.stream_type
-        logger.info("WebSocket ready for raw VES packets: %s", connection_id)
+            if not redis_available:
+                logger.warning(
+                    "Redis temporarily unavailable; waiting for recovery | "
+                    "ConnectionID=%s",
+                    connection_id,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 10.0)
+                continue
+            if connection is None:
+                logger.warning(
+                    "Connection metadata not found | ConnectionID=%s",
+                    connection_id,
+                )
+                await websocket.close(
+                    code=1008,
+                    reason="Connection metadata not found",
+                )
+                return
+            break
+        logger.info(
+            "WEBSOCKET_READY | ConnectionID=%s | Streams=%s",
+            connection_id,
+            list(connection.streams),
+        )
+        delay = 1.0
+        last_refresh = time.monotonic()
         while True:
-            packet = await websocket.receive_bytes()
+            try:
+                packet = await asyncio.wait_for(
+                    websocket.receive_bytes(),
+                    timeout=METADATA_REFRESH_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                # Refresh metadata even when the connection is idle.
+                if not await db.update_activity(connection_id):
+                    logger.warning(
+                        "Redis metadata refresh failed | ConnectionID=%s",
+                        connection_id,
+                    )
+                last_refresh = time.monotonic()
+                continue
             if not packet:
                 continue
-            if stream_type in {"PERFORMANCE", "PERF3GPP"}:
-                event_fields = utils.decode_ves_event(packet)
-                if event_fields is None or event_fields == b"":
-                    logger.warning("Rejected invalid performance VES packet for %s", connection_id)
-                    continue
-                kafka_payload = event_fields
-                await utils.write_packet(packet=kafka_payload, stream_type="PERFORMANCE")
-            elif stream_type == "PROPRIETARY":
-                # Legacy behavior publishes proprietary packets without protobuf decoding.
-                await utils.write_packet(packet=packet, stream_type="PROPRIETARY")
-            else:
-                logger.warning("Unsupported stream type %s for connection %s", stream_type, connection_id)
+            await utils.write_packet(
+                packet=packet,
+                connection_id=connection_id,
+            )
+            # Periodically refresh connection metadata.
+            if (
+                time.monotonic() - last_refresh
+                >= METADATA_REFRESH_SECONDS
+            ):
+                if not await db.update_activity(connection_id):
+                    logger.warning(
+                        "Redis metadata refresh failed | ConnectionID=%s",
+                        connection_id,
+                    )
+                last_refresh = time.monotonic()
     except WebSocketDisconnect as exc:
         logger.info(
-            "WebSocket disconnected: %s code=%s",
+            "WEBSOCKET_DISCONNECTED | ConnectionID=%s | Code=%s",
             connection_id,
             getattr(exc, "code", 1000),
         )
     except asyncio.CancelledError:
+        logger.info(
+            "WEBSOCKET_CANCELLED | ConnectionID=%s",
+            connection_id,
+        )
         raise
     except Exception:
-        logger.exception("WebSocket processing failed for %s", connection_id)
+        logger.exception(
+            "WEBSOCKET_PROCESSING_ERROR | ConnectionID=%s",
+            connection_id,
+        )
         try:
-            await websocket.close(code=1011, reason="Internal server error")
+            await websocket.close(
+                code=1011,
+                reason="Internal server error",
+            )
         except Exception:
-            logger.debug("WebSocket was already closed")
+            logger.debug(
+                "WebSocket already closed | ConnectionID=%s",
+                connection_id,
+            )
     finally:
-        logger.info("WebSocket handler finished: %s", connection_id)
+        logger.info(
+            "WEBSOCKET_HANDLER_FINISHED | ConnectionID=%s",
+            connection_id,
+        )
 
