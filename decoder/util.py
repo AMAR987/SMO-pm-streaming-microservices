@@ -1,8 +1,8 @@
+import os
 import asyncio
 import json
 import base64
 import logging
-from google.protobuf.json_format import MessageToDict
 from google.protobuf.json_format import MessageToDict
 from aiokafka.structs import TopicPartition, OffsetAndMetadata
 from protobuf_py import Perf3gppFields_pb2
@@ -19,17 +19,17 @@ from aiokafka.errors import (
     MessageSizeTooLargeError,
     KafkaError,
 )
-KAFKA_BOOTSTRAP_SERVERS = "10.1.3.85:29093"
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", os.getenv("KAFKA_BROKER", "10.1.3.85:29093"))
 KAFKA_SECURITY_CONFIG = {
     "security_protocol": "SASL_PLAINTEXT",
     "sasl_mechanism": "PLAIN", 
     "sasl_plain_username": "admin",
     "sasl_plain_password": "admin_secret",
 }
-INPUT_TOPIC = "get_kafka_topic"
-OUTPUT_TOPIC = "DECODED_PERF"
+INPUT_TOPIC = os.getenv("INPUT_TOPIC", "HV_VES_PERF3GPP")
+OUTPUT_TOPIC = os.getenv("OUTPUT_TOPIC", "DECODED_PERF")
 
-CONSUMER_GROUP_ID = "perf3gpp-decoder-group"
+CONSUMER_GROUP_ID = os.getenv("CONSUMER_GROUP_ID", "perf3gpp-decoder-group")
 
 CONSUMER_ID = "perf3gpp-consumer"
 PRODUCER_ID = "perf3gpp-producer"
@@ -109,17 +109,31 @@ def decode_perf_event(payload,reportingEntityName="unknown",sourceName="unknown"
                 "Invalid PERF3GPP version: "
                 f"{perf.perf3gppFieldsVersion}"
             )
-        return decode_meas_data(
-            perf,
-            reportingEntityName,
-            sourceName,
-            kpi_names
-        )
+        sourceName = perf.measDataCollection.measuredEntityUserName
+        event_addl_flds = dict(perf.eventAddlFlds)
+        stream_id = event_addl_flds.get("streamId", "")
+        numeric_keys = sorted(
+                    [key for key in event_addl_flds if str(key).isdigit()],
+                    key=lambda key: int(key)
+                )
+        extracted_kpi_names = [event_addl_flds[key] for key in numeric_keys]
+        decoded_metrics = decode_meas_data(
+                    perf,
+                    reportingEntityName,
+                    sourceName,
+                    extracted_kpi_names
+                )
+        decoded_output = {
+                    "sourcename": sourceName,
+                    "streamId": stream_id,
+                    "metrics": decoded_metrics
+                }
+        return decoded_output
     except Exception as error:
         raise RuntimeError(
             f"PERF Decode FAILED: {error}"
         ) from error
-def decode_meas_data(perf,reportingEntityName,sourceName,kpi_names=None):
+def decode_meas_data(perf,reportingEntityName,sourceName,kpi_names=None,stream_id=None,event_addl_flds=None):
     if perf is None:
         raise ValueError("PERF3GPP message is empty")
     metrics = []
@@ -142,6 +156,13 @@ def decode_meas_data(perf,reportingEntityName,sourceName,kpi_names=None):
             meas_results = measValue.measResults
 
             result_count = len(meas_results)
+            if not kpi_names:
+                numeric_keys = sorted(
+                    [key for key in event_addl_flds if str(key).isdigit()],
+                    key=lambda key: int(key))
+                kpi_names = [
+                    event_addl_flds[key]
+                    for key in numeric_keys]
             if kpi_names:
                 names = list(kpi_names)
                 values_per_sector = len(names)
@@ -172,17 +193,10 @@ def decode_meas_data(perf,reportingEntityName,sourceName,kpi_names=None):
                     else:
                         continue
                     metrics.append({
-                        "measurement": measurement,
-                        "tags": {
-                            "kpiname": kpi,
-                            "sourcename": sourceName,
-                            "sector": sector_id
-                        },
-                        "fields": {
-                            "kpivalue": value
-                        }
-                    })
-
+                        "kpiname": kpi,
+                        "sector": sector_id,
+                        "kpivalue": value
+                        })
     return metrics
 def transform_to_line_protocol(metric):
     measurement = metric["measurement"]
@@ -216,12 +230,11 @@ def decode_perf(encoded_data):
             raise ValueError(
                 "Encoded data is empty"
             )
-        decoded_data = decode_perf_event(
-            payload=encoded_data,
-            reportingEntityName="unknown",
-            sourceName="unknown",
-            kpi_names=None
-        )
+        decoded_data = decode_ves_event(
+                    payload=encoded_data,
+                    source_name="unknown",
+                    kpi_names=None
+                )
         return decoded_data
     except Exception as error:
         raise RuntimeError(
