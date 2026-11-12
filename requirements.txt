@@ -5,3 +5,4 @@ aiokafka
 redis
 protobuf
 lz4
+cramjam
