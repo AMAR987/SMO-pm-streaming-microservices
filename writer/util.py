@@ -1,5 +1,8 @@
 
 import asyncio
+import json
+from collections import defaultdict
+from influxdb_client import Point
 
 from confluent_kafka import KafkaException
 from confluent_kafka.aio import AIOConsumer
@@ -22,6 +25,59 @@ class MemoryBuffer:
     def task_done(self):
         self.queue.task_done()
 
+
+def transform_kafka_message(message):
+    if isinstance(message, bytes):
+        message = message.decode("utf-8")
+
+    if isinstance(message, str):
+        message = json.loads(message)
+
+    grouped_metrics = defaultdict(dict)
+
+    for metric in message["metrics"]:
+        kpiname = metric["kpiname"]
+        sector = metric["sector"]
+        kpivalue = metric["kpivalue"]
+
+        grouped_metrics[kpiname][sector] = kpivalue
+
+    transformed_metrics = []
+
+    for kpiname, sector_values in grouped_metrics.items():
+        for sector, value in sorted(sector_values.items()):
+            transformed_metrics.append({
+                "kpiname": kpiname,
+                "sector": str(sector),
+                "kpivalue": value
+            })
+
+    return {
+        "sourcename": message["sourcename"],
+        "streamId": message["streamId"],
+        "metrics": transformed_metrics
+    }
+
+
+def create_influx_point(message):
+    points = []
+
+    for metric in message["metrics"]:
+        kpiname = metric["kpiname"]
+        sector = metric["sector"]
+        value = metric["kpivalue"]
+
+        point = (
+            Point("hvves_data")
+            .tag("sourcename", message["sourcename"])
+            .tag("streamId", message["streamId"])
+            .tag("sector", sector)
+            .field(kpiname, float(value))
+        )
+
+        points.append(point)
+
+    return points
 
 def initialize_kafka(config):
     try:
@@ -74,14 +130,35 @@ def initialize_write_api(client, config):
     return client.write_api()
 
 
-async def write_to_influx(write_api, message, config):
+
+async def write_to_influx(write_api, messages, config):
     try:
+        
+        if isinstance(messages, dict):
+            messages = [messages]
+
+        
+        points = [
+            create_influx_point(message)
+            for message in messages
+        ]
+
+        if not points:
+            return True
+
+        
         await write_api.write(
             bucket=config["bucket"],
             org=config["org"],
-            record=message,
+            record=points,
+        )
+
+        print(
+            f"[INFLUX] Successfully wrote {len(points)} points.",
+            flush=True,
         )
         return True
+
     except Exception as error:
         print(f"[INFLUX] Write error: {error}", flush=True)
         return False

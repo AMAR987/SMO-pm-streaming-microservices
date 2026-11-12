@@ -4,6 +4,7 @@ from collections import deque
 from config import WRITER_CONFIG
 from util import (
     MemoryBuffer,
+    transform_kafka_message,
     initialize_kafka,
     handle_kafka_error,
     initialize_influx_client,
@@ -143,8 +144,32 @@ async def kafka_consumer(memory_buffer, ack_queue, commit_state, config):
                     handle_kafka_error(record.error())
                     continue
 
+                raw_message = record.value().decode("utf-8", errors="replace")
+
+                print(
+                    f"[KAFKA] Raw message received: {raw_message!r}",
+                    flush=True
+                )
+
+                try:
+                    transformed_message = transform_kafka_message(raw_message)
+                except (ValueError, KeyError, TypeError) as error:
+                    print(
+                        f"[TRANSFORM] Invalid Kafka message: {error}",
+                        flush=True
+                    )
+                    continue
+                    
+
+
+                print(
+                    "[TRANSFORMED]",
+                    transformed_message,
+                    flush=True
+                )
+
                 message_data = {
-                    "message": record.value().decode("utf-8"),
+                    "message": transformed_message,
                     "topic": record.topic(),
                     "partition": record.partition(),
                     "offset": record.offset(),
