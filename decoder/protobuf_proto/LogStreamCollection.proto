@@ -1,0 +1,8 @@
+syntax = "proto3";
+message LogStream {
+    string unit = 1 ; 
+    repeated string stdout = 2;
+    string reportingEntity = 3; 
+}
+
+option optimize_for=SPEED;

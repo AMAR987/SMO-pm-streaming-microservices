@@ -1,0 +1,10 @@
+version: "3.9"
+services:
+  decoder:
+    build: .
+    container_name: decoder
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=10.1.210.206:29093
+      - INPUT_TOPIC=HV_VES_PERF3GPP
+      - OUTPUT_TOPIC=DECODED_PERF
+      - CONSUMER_GROUP_ID=perf3gpp-decoder-group
