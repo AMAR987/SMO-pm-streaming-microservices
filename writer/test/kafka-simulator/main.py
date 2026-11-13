@@ -1,6 +1,7 @@
-
 import time
 import json
+import random
+import uuid
 
 from confluent_kafka import Producer
 
@@ -19,43 +20,55 @@ def create_producer():
 
 def delivery_callback(error, message):
     if error:
-        print(f"Delivery failed: {error}")
+        print(f"[PRODUCER] Delivery failed: {error}", flush=True)
         return
 
     print(
-        f"Delivered: topic={message.topic()}, "
+        f"[PRODUCER] Delivered: topic={message.topic()}, "
         f"partition={message.partition()}, "
-        f"offset={message.offset()}"
+        f"offset={message.offset()}",
+        flush=True,
     )
 
 
-
 def create_message(sequence):
+    metrics = []
+
+    kpi_names = [
+        "RRC.ConnMean",
+        "RRC.ConnMax",
+        "RRC.InactiveConnMean",
+        "RRC.InactiveConnMax",
+    ]
+
+    for sector in [1, 2]:
+        for kpiname in kpi_names:
+            metrics.append({
+                "kpiname": kpiname,
+                "sector": sector,
+                "kpivalue": round(random.uniform(0, 10), 2),
+            })
+
     return {
-        "sourcename": "client5010_f00d0c4b",
-        "streamId": "B48256",
-        "metrics": [
-            {"kpiname": "RRU.PrbAvailDl", "sector": 1, "kpivalue": 6.0},
-            {"kpiname": "RRU.PrbAvailUl", "sector": 1, "kpivalue": 9.0},
-            {"kpiname": "RRU.PrbUsedDl", "sector": 1, "kpivalue": 0.0},
-            {"kpiname": "RRU.PrbUsedUl", "sector": 1, "kpivalue": 8.0},
-            {"kpiname": "RRU.PrbAvailDl", "sector": 2, "kpivalue": 8.0},
-            {"kpiname": "RRU.PrbAvailUl", "sector": 2, "kpivalue": 3.0},
-            {"kpiname": "RRU.PrbUsedDl", "sector": 2, "kpivalue": 8.0},
-            {"kpiname": "RRU.PrbUsedUl", "sector": 2, "kpivalue": 4.0}
-        ]
+        "sourcename": f"client_{uuid.uuid4().hex[:8]}",
+        "streamId": f"stream_{sequence}",
+        "metrics": metrics,
     }
 
 
 def produce_messages():
     producer = create_producer()
+
     topic = KAFKA_CONFIG["topic"]
     count = KAFKA_CONFIG["message_count"]
     interval = KAFKA_CONFIG["message_interval"]
 
-    print(f"Broker: {KAFKA_CONFIG['bootstrap_servers']}")
-    print(f"Topic: {topic}")
-    print(f"Sending {count} test messages...")
+    print(
+        f"[PRODUCER] Broker: {KAFKA_CONFIG['bootstrap_servers']}",
+        flush=True,
+    )
+    print(f"[PRODUCER] Topic: {topic}", flush=True)
+    print(f"[PRODUCER] Sending {count} test messages...", flush=True)
 
     try:
         for sequence in range(1, count + 1):
@@ -69,24 +82,30 @@ def produce_messages():
                 callback=delivery_callback,
             )
 
-            
             producer.poll(0)
 
-            print(f"Queued message {sequence}: {message_json}")
+            print(
+                f"[PRODUCER] Queued message {sequence}: {message_json}",
+                flush=True,
+            )
+
             time.sleep(interval)
 
     except BufferError as error:
-        print(f"Producer queue is full: {error}")
+        print(f"[PRODUCER] Queue is full: {error}", flush=True)
 
     finally:
         remaining = producer.flush(timeout=30)
 
         if remaining:
-            print(f"Warning: {remaining} message(s) remain undelivered.")
+            print(
+                f"[PRODUCER] Warning: {remaining} messages undelivered.",
+                flush=True,
+            )
         else:
-            print("All queued messages have completed delivery.")
+            print("[PRODUCER] All messages delivered.", flush=True)
 
-    print("Simulator finished.")
+    print("[PRODUCER] Simulator finished.", flush=True)
 
 
 if __name__ == "__main__":
