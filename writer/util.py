@@ -70,9 +70,9 @@ def create_influx_point(message):
         point = (
             Point("hvves_data")
             .tag("sourcename", message["sourcename"])
-            .tag("streamId", message["streamId"])
-            .tag("sector", sector)
-            .field(kpiname, float(value))
+            .tag("kpiname", kpiname)
+            .tag("sector", str(sector))
+            .field("kpivalue", float(value))
         )
 
         points.append(point)
