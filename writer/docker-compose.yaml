@@ -14,7 +14,7 @@ services:
       KAFKA_USERNAME: admin
       KAFKA_PASSWORD: admin_secret
 
-      INFLUX_URL: http://host.docker.internal:8086
+      INFLUX_URL: http://influxdb:8086
 
       PYTHONUNBUFFERED: "1"
 
@@ -26,6 +26,24 @@ services:
 
     networks:
       - hv-ves-net
+
+  influxdb:
+    image: influxdb:2
+    container_name: influxdb
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb2-config:/etc/influxdb2
+      - influxdb2-data:/var/lib/influxdb2
+    restart: unless-stopped
+    networks:
+      - hv-ves-net
+
+volumes:
+  influxdb2-config:
+    external: true
+  influxdb2-data:
+    external: true
 
   
 networks:
