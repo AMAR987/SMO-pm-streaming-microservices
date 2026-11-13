@@ -133,20 +133,17 @@ def initialize_write_api(client, config):
 
 async def write_to_influx(write_api, messages, config):
     try:
-        
         if isinstance(messages, dict):
             messages = [messages]
 
-        
-        points = [
-            create_influx_point(message)
-            for message in messages
-        ]
+        points = []
+
+        for message in messages:
+            points.extend(create_influx_point(message))
 
         if not points:
             return True
 
-        
         await write_api.write(
             bucket=config["bucket"],
             org=config["org"],
@@ -157,12 +154,12 @@ async def write_to_influx(write_api, messages, config):
             f"[INFLUX] Successfully wrote {len(points)} points.",
             flush=True,
         )
+
         return True
 
     except Exception as error:
         print(f"[INFLUX] Write error: {error}", flush=True)
         return False
-
 
 
 async def commit_kafka_message(consumer, message_data):

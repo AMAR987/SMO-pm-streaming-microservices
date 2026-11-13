@@ -3,13 +3,13 @@ import os
 WRITER_CONFIG = {
     
     "bootstrap_servers": os.getenv(
-        "KAFKA_BOOTSTRAP_SERVERS", "localhost:29093"
+        "KAFKA_BOOTSTRAP_SERVERS", "10.1.3.85:29093"
     ),
     "group_id": os.getenv(
         "KAFKA_GROUP_ID", "n-writer-test-group"
     ),
     "kafka_topic": os.getenv(
-        "KAFKA_TOPIC", "writer-test-topic"
+        "KAFKA_TOPIC", "DECODED_PERF"
     ),
     "auto_offset_reset": "earliest",
     "security_protocol": "SASL_PLAINTEXT",
