@@ -20,7 +20,7 @@ WRITER_CONFIG = {
     ),
 
 
-    "url": os.getenv("INFLUX_URL", "http://localhost:8086"),
+    "url": os.getenv("INFLUX_URL", "http://influxdb:8086"),
     "token": os.getenv("INFLUX_TOKEN", "RUVu5qHGRw9EuTl61-7eIhryXa6A31DzH0y7NGii9HrIBdLbv29h3pjzj14z6gPlT_u9qNFGI1ZtioIEpaqgPw=="),
     "org": os.getenv("INFLUX_ORG", "org"),
     "bucket": os.getenv("INFLUX_BUCKET", "bucket"),
