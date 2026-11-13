@@ -45,7 +45,7 @@ services:
       KAFKA_CFG_ZOOKEEPER_CONNECT: message-router-zookeeper:2181
 
       KAFKA_CFG_LISTENERS: INTERNAL://:9092,EXTERNAL://:9093
-      KAFKA_CFG_ADVERTISED_LISTENERS: INTERNAL://message-router-kafka-0:9092,EXTERNAL://10.1.3.85:29093
+      KAFKA_CFG_ADVERTISED_LISTENERS: INTERNAL://message-router-kafka-0:9092,EXTERNAL://message-router-kafka-0:9093
       KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:SASL_PLAINTEXT,EXTERNAL:SASL_PLAINTEXT
       KAFKA_CFG_INTER_BROKER_LISTENER_NAME: INTERNAL
 
@@ -63,6 +63,7 @@ services:
       ALLOW_PLAINTEXT_LISTENER: "no"
     ports:
       - "29093:9093"
+      - "29092:9092"
     volumes:
       - kafka-data:/bitnami/kafka
     restart: unless-stopped
@@ -123,7 +124,64 @@ services:
        INPUT_TOPIC: HV_VES_PERF3GPP
        OUTPUT_TOPIC: DECODED_PERF
        CONSUMER_GROUP_ID: perf3gpp-decoder-group
+    networks:
+      - hv-ves-net
+  n-writer:
+    
+    build: ./writer
+    container_name: n-writer
+    working_dir: /app
 
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: message-router-kafka-0:9092
+      KAFKA_GROUP_ID: n-writer-decoded-perf-group
+      KAFKA_TOPIC: DECODED_PERF
+      KAFKA_USERNAME: admin
+      KAFKA_PASSWORD: admin_secret
+
+      INFLUX_URL: http://bulk-pm-influx:8086
+
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      - bulk-pm-influx
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - hv-ves-net
+
+
+    restart: unless-stopped
+  bulk-pm-influx:
+      image: githost.wisig.com:5050/sdnc1/sdnc_docker_images/wisig-influxdb:stable-latest
+      environment:
+        INFLUXDB_HTTP_FLUX_ENABLED: true
+      container_name: bulk-pm-influx
+      hostname: bulk-pm-influx
+      ports:
+        - "8086:8086"
+      restart: unless-stopped
+      volumes:
+        - ../data/influxdb_data:/var/lib/influxdb
+      entrypoint: >
+        /bin/sh -c "
+        influxd run &
+        while ! influx -execute 'SHOW DATABASES'; do
+          echo 'Waiting for InfluxDB to start...';
+          sleep 5;
+        done;
+        influx -execute 'CREATE DATABASE bulk_pm_data' &&
+        influx -execute 'CREATE DATABASE message_data' &&
+        influx -execute 'CREATE DATABASE telemetry_bucket' &&
+        influx -execute 'CREATE DATABASE streaming_pm_data';
+        wait"
+      healthcheck:
+        test: ["CMD", "curl", "-f", "http://bulk-pm-influx:8086/ping"]
+        interval: 5s
+        timeout: 3s
+        retries: 20
+        start_period: 10s
+      networks:
+      - hv-ves-net
 volumes:
   redis-data:
   kafka-data:
