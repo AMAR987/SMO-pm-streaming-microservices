@@ -109,7 +109,7 @@ def decode_perf_event(payload,reportingEntityName="unknown",sourceName="unknown"
                 "Invalid PERF3GPP version: "
                 f"{perf.perf3gppFieldsVersion}"
             )
-        sourceName = perf.measDataCollection.measuredEntityUserName
+        sourceName = perf.measDataCollection.measuredEntityUserName.split("_", 1)[0]
         event_addl_flds = dict(perf.eventAddlFlds)
         stream_id = event_addl_flds.get("streamId", "")
         numeric_keys = sorted(
