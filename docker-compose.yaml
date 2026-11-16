@@ -139,11 +139,11 @@ services:
       KAFKA_USERNAME: admin
       KAFKA_PASSWORD: admin_secret
 
-      INFLUX_URL: http://bulk-pm-influx:8086
+      INFLUX_URL: http://influxdb:8086
 
       PYTHONUNBUFFERED: "1"
     depends_on:
-      - bulk-pm-influx
+      - influxdb
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
@@ -151,36 +151,27 @@ services:
 
 
     restart: unless-stopped
-  bulk-pm-influx:
-      image: githost.wisig.com:5050/sdnc1/sdnc_docker_images/wisig-influxdb:stable-latest
-      environment:
-        INFLUXDB_HTTP_FLUX_ENABLED: true
-      container_name: bulk-pm-influx
-      hostname: bulk-pm-influx
-      ports:
-        - "8086:8086"
-      restart: unless-stopped
-      volumes:
-        - ../data/influxdb_data:/var/lib/influxdb
-      entrypoint: >
-        /bin/sh -c "
-        influxd run &
-        while ! influx -execute 'SHOW DATABASES'; do
-          echo 'Waiting for InfluxDB to start...';
-          sleep 5;
-        done;
-        influx -execute 'CREATE DATABASE bulk_pm_data' &&
-        influx -execute 'CREATE DATABASE message_data' &&
-        influx -execute 'CREATE DATABASE telemetry_bucket' &&
-        influx -execute 'CREATE DATABASE streaming_pm_data';
-        wait"
-      healthcheck:
-        test: ["CMD", "curl", "-f", "http://bulk-pm-influx:8086/ping"]
-        interval: 5s
-        timeout: 3s
-        retries: 20
-        start_period: 10s
-      networks:
+  influxdb:
+    image: influxdb:2
+    container_name: influxdb
+
+    ports:
+      - "8086:8086"
+
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: "saikiran45"
+      DOCKER_INFLUXDB_INIT_PASSWORD: "sai@2426"
+      DOCKER_INFLUXDB_INIT_ORG: "org"
+      DOCKER_INFLUXDB_INIT_BUCKET: "bucket"
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: "RUVu5qHGRw9EuTl61-7eIhryXa6A31DzH0y7NGii9HrIBdLbv29h3pjzj14z6gPlT_u9qNFGI1ZtioIEpaqgPw=="
+
+    volumes:
+      - ./influxdb2-config:/etc/influxdb2
+      - ./influxdb2-data:/var/lib/influxdb2
+
+    restart: unless-stopped
+    networks:
       - hv-ves-net
 volumes:
   redis-data:
