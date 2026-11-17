@@ -1,8 +1,0 @@
-fastapi
-uvicorn[standard]
-uvloop
-aiokafka
-redis
-protobuf
-lz4
-cramjam
