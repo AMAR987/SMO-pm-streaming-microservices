@@ -21,9 +21,9 @@ WRITER_CONFIG = {
 
 
     "url": os.getenv("INFLUX_URL", "http://influxdb:8086"),
-    "token": os.getenv("INFLUX_TOKEN", "RUVu5qHGRw9EuTl61-7eIhryXa6A31DzH0y7NGii9HrIBdLbv29h3pjzj14z6gPlT_u9qNFGI1ZtioIEpaqgPw=="),
+    "token": os.getenv("INFLUX_TOKEN", "Rzl82wmK6f2v-nBBQ5ez6QHXMCbzi7w2QU5et1T3nQQSXdVuAJ4cBwjAiRU0kisiVemvQGRiKDgDExjl2dhRvg=="),
     "org": os.getenv("INFLUX_ORG", "org"),
-    "bucket": os.getenv("INFLUX_BUCKET", "bucket"),
+    "bucket": os.getenv("INFLUX_BUCKET", "streaming_pm_bucket"),
 
 
     "buffer_size": 10000,

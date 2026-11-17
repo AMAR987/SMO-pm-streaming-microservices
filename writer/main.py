@@ -144,7 +144,22 @@ async def kafka_consumer(memory_buffer, ack_queue, commit_state, config):
                     handle_kafka_error(record.error())
                     continue
 
-                raw_message = record.value().decode("utf-8", errors="replace")
+                raw_value = record.value()
+
+                if raw_value is None:
+                    print(
+                        f"[KAFKA] Received null message; skipping "
+                        f"topic={record.topic()} "
+                        f"partition={record.partition()} "
+                        f"offset={record.offset()}",
+                        flush=True,
+                    )
+                    continue
+
+                raw_message = raw_value.decode(
+                    "utf-8",
+                    errors="replace"
+                )
 
                 print(
                     f"[KAFKA] Raw message received: {raw_message!r}",
