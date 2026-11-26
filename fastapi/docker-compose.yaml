@@ -92,20 +92,25 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: hv-ves-fastapi
+
     ports:
       - "8000:8000"
+
     environment:
       REDIS_HOST: redis
       REDIS_PORT: "6379"
       REDIS_DB: "0"
       CONNECTION_TTL: "300"
+
       KAFKA_BOOTSTRAP_SERVERS: message-router-kafka-0:9092
       KAFKA_SECURITY_PROTOCOL: SASL_PLAINTEXT
       KAFKA_SASL_MECHANISM: PLAIN
       KAFKA_USERNAME: admin
       KAFKA_PASSWORD: admin_secret
+
       PERF_KAFKA_TOPIC: HV_VES_PERF3GPP
       LOG_KAFKA_TOPIC: HV_VES_PROPRIETARY
+
     depends_on:
       redis:
         condition: service_healthy
